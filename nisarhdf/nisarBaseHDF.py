@@ -851,6 +851,36 @@ class nisarBaseHDF():
             (self.SLCRangeSize - 1) * self.SLCRangePixelSize
         self.SLCCenterRange = (self.SLCNearRange + self.SLCFarRange) * 0.5
 
+    def getCubeEpoch(self, secondary=False):
+        '''
+        Return the datetime epoch ("seconds since <epoch>") for this image's
+        own orbit/state-vector time axis (metadata/orbit, or .../reference
+        or .../secondary for interferometric products -- the same group
+        parseStateVectors() reads to build self.orbit), parsed from that
+        group's 'time' dataset 'units' attribute.
+
+        NISAR fixes this epoch at midnight of the day the whole pass
+        started, the same for every frame in the pass -- so a frame acquired
+        after a UTC-midnight rollover has orbit/cube times that run past
+        86400s rather than resetting to 0. Reference and secondary images
+        (different acquisitions, different passes) each have their own
+        epoch, hence the secondary flag -- using the wrong one here would
+        desync SLCFirstZeroDopplerTime from self.orbit's actual time domain
+        and break orbit interpolation (RTtoECEF/getSatPositionAndVel).
+        Returns None (caller falls back to the acquisition's own
+        calendar-day midnight) if unavailable for this product type.
+        '''
+        try:
+            orbitGroup = self.h5[self.product]['metadata']['orbit']
+            if self.product not in ['RSLC', 'GCOV', 'GSLC']:
+                orbitGroup = orbitGroup['secondary' if secondary
+                                        else 'reference']
+            units = self.parseString(orbitGroup['time'].attrs['units'])
+            epochStr = units.split('seconds since ')[-1]
+            return datetime.strptime(epochStr[:19], '%Y-%m-%dT%H:%M:%S')
+        except Exception:
+            return None
+
     def getSLCZeroDopplerTime(self, secondary=False):
         '''
         Get Zero doppler start time from the SLC information in the metdaa
@@ -880,9 +910,15 @@ class nisarBaseHDF():
         earlyTime, _ = self.parseDateStr(self.parseString(
             imageParams['zeroDopplerStartTime']))
         #
-        # SLC first time
-        self.SLCFirstZeroDopplerTime = \
-            (earlyTime - earlyTime.replace(**zeroTime)).total_seconds()
+        # SLC first time, referenced to the same epoch as this image's own
+        # orbit/geolocation cube (see getCubeEpoch()) so that orbit
+        # interpolation (RTtoECEF) and cube-interpolated quantities derived
+        # from MLFirstZeroDopplerTime/MLLastZeroDopplerTime (e.g.
+        # getSquintAnglePolynomial, getCenterIncidenceAngle) stay in range
+        # for frames acquired just after a UTC-midnight rollover.
+        epoch = self.getCubeEpoch(secondary=secondary) or \
+            earlyTime.replace(**zeroTime)
+        self.SLCFirstZeroDopplerTime = (earlyTime - epoch).total_seconds()
         self.SLCZeroDopplerTimeSpacing = self.toScalar(
             imageParams['zeroDopplerTimeSpacing'])
         self.SLCLastZeroDopplerTime = self.SLCFirstZeroDopplerTime + \
@@ -2344,6 +2380,61 @@ class nisarBaseHDF():
             self.losUnitVectorX = LOSx.astype(np.float32)
             self.losUnitVectorY = LOSy.astype(np.float32)
         return LOSx, LOSy
+
+    def getSquintAnglePolynomial(self, nRangeSamples=9, nAzimuthSamples=9):
+        '''
+        Fit squint(r, a) = c0 + c1*r' + c2*a' + c3*a'^2 + c4*r'*a' +
+        c5*r'^2 (r' = slantRange - MLCenterRange, a' = zeroDopplerTime -
+        MLMidZeroDopplerTime) from the geolocationGrid cube's
+        losUnitVector/alongTrackUnitVector, and save the result as
+        self.squintAnglePolynomial = {'coefficients': [c0..c5],
+        'refRange': ..., 'refAzimuthTime': ...}.
+
+        Returns
+        -------
+        None.
+
+        '''
+        # Sampling grid over this sub-frame's range/azimuth extent
+        rangeSamples = np.linspace(self.MLNearRange, self.MLFarRange,
+                                   nRangeSamples)
+        azimuthSamples = np.linspace(self.MLFirstZeroDopplerTime,
+                                     self.MLLastZeroDopplerTime,
+                                     nAzimuthSamples)
+        R, A = np.meshgrid(rangeSamples, azimuthSamples, indexing='ij')
+        # Squint's height-sensitivity is negligible (see
+        # nisarErrors/Documents/plotSquintError.md), so sample at a single
+        # fixed height -- the geolocationGrid cube's own mid-level height,
+        # which is guaranteed in-bounds for the interpolator.
+        heightAboveEllipsoid = np.array(
+            self.h5[self.product]['metadata']['geolocationGrid'][
+                'heightAboveEllipsoid'])
+        Z = np.full(R.shape,
+                   heightAboveEllipsoid[len(heightAboveEllipsoid) // 2])
+        # Sample los/along-track unit vectors and compute squint (deviation
+        # of the los heading from broadside relative to the along-track
+        # heading; L flips the nominal +/-90 deg offset for look direction)
+        losX, losY = self.losUnitVectorCube(R, A, Z)
+        atX, atY = self.alongTrackUnitVectorCube(R, A, Z)
+        losHeading = np.degrees(np.arctan2(losX, losY)) % 360
+        atHeading = np.degrees(np.arctan2(atX, atY)) % 360
+        diff = ((losHeading - atHeading + 180) % 360) - 180
+        L = 1.0 if self.LookDirection.lower() == 'left' else -1.0
+        squint = diff - 90.0 * L
+        # Center range/azimuth on the frame's existing reference point for
+        # numerical conditioning (raw slant range ~1e6 m, raw zero-Doppler
+        # time ~1e4 s of day are poorly conditioned for a quadratic fit)
+        rPrime = (R - self.MLCenterRange).flatten()
+        aPrime = (A - self.MLMidZeroDopplerTime).flatten()
+        designMatrix = np.array([rPrime * 0 + 1, rPrime, aPrime, aPrime**2,
+                                 rPrime * aPrime, rPrime**2]).T
+        coefficients, _, _, _ = np.linalg.lstsq(
+            designMatrix, squint.flatten(), rcond=None)
+        self.squintAnglePolynomial = {
+            'coefficients': list(coefficients),
+            'refRange': self.MLCenterRange,
+            'refAzimuthTime': self.MLMidZeroDopplerTime,
+            }
 
     # Gelocaton code that should not be needed given geolocation cubes
     # Most is GrIMP specfic except what is need for

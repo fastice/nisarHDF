@@ -99,7 +99,7 @@ class nisarRUNWHDF(nisarBaseRangeDopplerHDF):
         self.getTimeToFirstSample()
         self.getSkewOffsets()
         self.getCenterIncidenceAngle()
-        self.getSquint()
+        self.getSquint(secondary=secondary)
         self.getDeltaT()
         self.getCenterLatLon()
         self.getSceneCenterSatelliteHeight()
@@ -132,9 +132,32 @@ class nisarRUNWHDF(nisarBaseRangeDopplerHDF):
                           'unwrappedPhase',
                           'digitalElevationModel']
             self.loadData(fields, noLoadData=noLoadData)
-            
 
-    def cleanIonosphere(self, edge_mask_px=80, iterations_low=250, 
+    def getSquint(self, secondary=False):
+        '''
+        Leave the legacy scalar Squint field untouched (older code uses it
+        for a deskew time delay to zero Doppler -- a different quantity
+        from the residual squint *angle* fit below, so it must not be
+        repurposed) and, for the reference image only, fit the real
+        squintAnglePolynomial from the geolocationGrid cube. The secondary
+        image shares the reference's HDF5 file and geolocationGrid cube
+        (see self.secondary.h5 = self.h5 above), whose zero-Doppler time
+        axis only spans the reference pass's absolute time -- sampling it
+        at the secondary's own (different-day) azimuth times would fall
+        outside the cube and return NaN, so the secondary keeps
+        squintAnglePolynomial=None.
+
+        Returns
+        -------
+        None.
+
+        '''
+        nisarBaseRangeDopplerHDF.getSquint(self)
+        if secondary:
+            return
+        self.getSquintAnglePolynomial()
+
+    def cleanIonosphere(self, edge_mask_px=80, iterations_low=250,
                         downsample=8, sigma_az=150, sigma_rg=10):
         """
         Complete pipeline: 

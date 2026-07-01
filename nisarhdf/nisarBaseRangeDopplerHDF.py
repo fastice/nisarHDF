@@ -600,6 +600,7 @@ class nisarBaseRangeDopplerHDF(nisarBaseHDF):
                 'MLCenterRange', 'MLFarRange', 'RangeErrorCorrection',
                 'LookDirection', 'PassType', 'CenterLatLon',
                 'TimeToFirstSLCSample', 'SkewOffset', 'Squint',
+                'squintAnglePolynomial',
                 'EarthRadiusMajor', 'EarthRadiusMinor', 'MLIncidenceCenter',
                 'SpaceCraftAltitude', 'CorrectedTime', 'Wavelength',
                 'SLCRangePixelSize', 'SLCAzimuthPixelSize', 'deltaT']
@@ -607,6 +608,21 @@ class nisarBaseRangeDopplerHDF(nisarBaseHDF):
         # Get values for these keys
         for key in keys:
             self.geodatDict[key] = getattr(self, key)
+        #
+        # Flat top-level fields mirroring squintAnglePolynomial, since GDAL's
+        # OGR GeoJSON driver (used by mosaic3d's C-side reader) can't read
+        # nested objects -- only flat scalars/lists, like state vectors.
+        if self.squintAnglePolynomial is not None:
+            self.geodatDict['squintCoefficients'] = \
+                self.squintAnglePolynomial['coefficients']
+            self.geodatDict['squintRefRange'] = \
+                self.squintAnglePolynomial['refRange']
+            self.geodatDict['squintRefAzimuthTime'] = \
+                self.squintAnglePolynomial['refAzimuthTime']
+        else:
+            self.geodatDict['squintCoefficients'] = None
+            self.geodatDict['squintRefRange'] = None
+            self.geodatDict['squintRefAzimuthTime'] = None
         #
         self.geodatDict['orbit'] = self.referenceOrbit
         self.geodatDict['frame'] = self.frame
@@ -685,6 +701,7 @@ class nisarBaseRangeDopplerHDF(nisarBaseHDF):
 
         '''
         self.Squint = 0.0
+        self.squintAnglePolynomial = None
 
     def getDeltaT(self):
         '''

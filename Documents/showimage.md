@@ -32,6 +32,7 @@ showimage [options] FILE [FILE ...]
 | `--mod X` | off | Display image modulo X (useful for phase wrapping) |
 | `--decFactor N` | auto-fit screen | Decimation factor (per-image when files differ in size) |
 | `--fullRes` | — | Display at full resolution (equivalent to `--decFactor 1`) |
+| `--right` | — | Place the control palette at the right edge of the screen, with the image and plot/profile windows opening to its left (mirrors the default left-to-right layout) — lets a second instance run without overlapping the first |
 
 **Velocity display (GDAL only):**
 

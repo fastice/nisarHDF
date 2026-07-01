@@ -250,7 +250,7 @@ def writeVrtOnly(productObj, filenameRoot, fields,
         sourceFiles.append(srcPath)
         descriptions.append(field)
         dataTypes.append(_getH5DType(productObj, field, layer=layer))
-        noDataValues.append(productObj.findNoDataValue(field, tiff=False))
+        noDataValues.append(productObj.findNoDataValue(field, tiff=True))
 
     _createHDF5Vrt(vrtFile, rgSize, azSize,
                    sourceFiles, descriptions, dataTypes, noDataValues,

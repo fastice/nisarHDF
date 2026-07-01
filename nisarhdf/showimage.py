@@ -5,6 +5,11 @@ import os
 import sys
 import numpy as np
 
+try:
+    from osgeo import gdal
+except ImportError:
+    gdal = None
+
 DPI = 100
 CBAR_PX = 120   # pixels reserved for colorbar panel
 SCROLLBAR_W = 18  # scrollbar widget thickness
@@ -90,6 +95,14 @@ def findBandByName(ds, name):
         if band.GetMetadata().get('Description') == name:
             return b
     return None
+
+
+def isNisarOriginLowerProduct(filename):
+    """True if filename looks like a NISAR RIFG/RUNW/ROFF-derived product (native
+    range/azimuth grid, origin-lower convention) rather than an unrelated file that
+    happens to start with the letter 'R' (e.g. a RACMO SMB correction grid)."""
+    base = os.path.basename(filename)
+    return any(p in base for p in ('RIFG', 'RUNW', 'ROFF'))
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +278,29 @@ def openNisarH5(filepath, frequency='frequencyA', pol=None):
         h5.close()
         sys.exit(f'showimage: no displayable fields found in {filepath} ({product})')
 
-    return nx, ny, product, loaders, h5
+    col_coords = None  # zeroDopplerTime per row
+    row_coords = None  # slantRange per col
+    _pt_map = {
+        'RIFG': 'interferogram', 'RUNW': 'interferogram',
+        'ROFF': 'pixelOffsets', 'GOFF': 'pixelOffsets',
+        'GUNW': ('unwrappedInterferogram' if 'unwrappedInterferogram' in freq_grp
+                 else 'wrappedInterferogram'),
+    }
+    _pt = _pt_map.get(product)
+    if _pt and _pt in freq_grp:
+        _cg = freq_grp[_pt]
+        try:
+            if 'zeroDopplerTime' in _cg:
+                col_coords = np.array(_cg['zeroDopplerTime'])
+        except Exception:
+            pass
+        try:
+            if 'slantRange' in _cg:
+                row_coords = np.array(_cg['slantRange'])
+        except Exception:
+            pass
+
+    return nx, ny, product, loaders, h5, col_coords, row_coords
 
 
 def hsvSpeedRender(speed, vmin=1.0, vmax=3000.0):
@@ -488,6 +523,22 @@ def makeColorbarFig(cmap, vmin, vmax, height_px):
     return fig
 
 
+def _rebuildColorbar(ref, cmap, vmin, vmax):
+    """Redraw a pane's standalone colorbar figure in place after a rescale/recolor."""
+    import matplotlib.cm as mcm
+    import matplotlib.colors as mcolors
+
+    if ref['cbar_fig'] is None:
+        return
+    ref['cbar_fig'].clear()
+    cax = ref['cbar_fig'].add_axes([0.25, 0.05, 0.35, 0.9])
+    sm = mcm.ScalarMappable(cmap=mcm.get_cmap(cmap),
+                             norm=mcolors.Normalize(vmin=vmin, vmax=vmax))
+    sm.set_array([])
+    ref['cbar_fig'].colorbar(sm, cax=cax)
+    ref['cbar_cv'].draw()
+
+
 def bindScroll(tk_canvas):
     """Bind mouse-wheel scroll for Windows/Mac and Linux."""
     def _y(event):
@@ -506,12 +557,16 @@ def bindScroll(tk_canvas):
 # Main display
 # -----------------------------------------------------------------------
 
-def showImage(image_defs, sw, sh, switch_infos=None):
+def showImage(image_defs, sw, sh, switch_infos=None, rtl=False):
     """Display 1–3 images side by side with a floating control palette.
 
     image_defs: list of dicts, each with keys:
         dec (ndarray), title (str), cmap (str), vmin (float), vmax (float), is_rgb (bool)
     Images may differ in size; each pane gets its own scrollregion.
+    rtl: if True, place the control palette at the right edge of the screen,
+        with the image and plot/profile windows opening to its left
+        (mirror of the default left-to-right layout) — lets a second
+        instance be run without overlapping the first.
     """
     import tkinter as tk
     from tkinter import ttk
@@ -520,6 +575,10 @@ def showImage(image_defs, sw, sh, switch_infos=None):
     n_imgs = len(image_defs)
     max_ny = max(d['dec'].shape[0] for d in image_defs)
     max_nx = max(d['dec'].shape[1] for d in image_defs)
+
+    def _disp(arr, ol):
+        """Flip array vertically for display when origin is lower (dy > 0)."""
+        return np.flipud(arr) if ol else arr
 
     root = tk.Tk()
     root.title(' | '.join(f'{i+1}) {os.path.basename(d["title"])}'
@@ -536,16 +595,17 @@ def showImage(image_defs, sw, sh, switch_infos=None):
     col_active          = [False]
     row_active          = [False]
     lines_visible       = [True]
+    coords_active       = [any(d.get('col_coords') is not None for d in image_defs)]
     overlay_set_visible = [None]
     all_same_size = all(d['dec'].shape == image_defs[0]['dec'].shape for d in image_defs)
     scroll_synced = [all_same_size]  # default: synced iff all same size
     profile_pts         = []
     # per-mode state; each window is independent
     plot_states = {
-        'col': {'win': None, 'axes': None, 'fig': None,
-                'canvas': None, 'single': False},
-        'row': {'win': None, 'axes': None, 'fig': None,
-                'canvas': None, 'single': False},
+        'col': {'win': None, 'axes': None, 'fig': None, 'canvas': None, 'single': False,
+                'bias_vars': [], 'remove_mean': [False], 'history': []},
+        'row': {'win': None, 'axes': None, 'fig': None, 'canvas': None, 'single': False,
+                'bias_vars': [], 'remove_mean': [False], 'history': []},
     }
 
     btn_col = ttk.Frame(palette)
@@ -556,8 +616,9 @@ def showImage(image_defs, sw, sh, switch_infos=None):
     col_btn     = ttk.Button(btn_col, text='Col Plot')
     row_btn     = ttk.Button(btn_col, text='Row Plot')
     lines_btn   = ttk.Button(btn_col, text='Lines ✓')
+    coords_btn  = ttk.Button(btn_col, text='Coords ✓' if coords_active[0] else 'Coords')
     quit_btn    = ttk.Button(btn_col, text='Quit', command=root.destroy)
-    core_btns = [pick_btn, profile_btn, col_btn, row_btn, lines_btn]
+    core_btns = [pick_btn, profile_btn, col_btn, row_btn, lines_btn, coords_btn]
     if n_imgs > 1:
         sync_btn = ttk.Button(btn_col,
                               text='Sync ✓' if scroll_synced[0] else 'Sync')
@@ -590,6 +651,22 @@ def showImage(image_defs, sw, sh, switch_infos=None):
         _ent = ttk.Entry(_row_f, textvariable=_var, width=8)
         _ent.pack(side='left', fill='x', expand=True)
         mod_entries.append((_var, _ent))
+
+    n_non_rgb = sum(1 for d in image_defs if not d['is_rgb'])
+    common_vmin_var = tk.StringVar(value='')
+    common_vmax_var = tk.StringVar(value='')
+    common_scale_btn = None
+    if n_non_rgb > 1:
+        ttk.Separator(btn_col, orient='horizontal').pack(fill='x', pady=(4, 2))
+        ttk.Label(btn_col, text='Common scale (min/max):', anchor='w').pack(fill='x', padx=2)
+        _cs_row = ttk.Frame(btn_col)
+        _cs_row.pack(fill='x', pady=1, padx=2)
+        _cs_min_ent = ttk.Entry(_cs_row, textvariable=common_vmin_var, width=6)
+        _cs_min_ent.pack(side='left', fill='x', expand=True, padx=(0, 2))
+        _cs_max_ent = ttk.Entry(_cs_row, textvariable=common_vmax_var, width=6)
+        _cs_max_ent.pack(side='left', fill='x', expand=True)
+        common_scale_btn = ttk.Button(btn_col, text='Common Scale')
+        common_scale_btn.pack(side='top', fill='x', pady=2, padx=2)
 
     status_var = tk.StringVar(value='Ready')
     status_lbl = ttk.Label(palette, textvariable=status_var, anchor='nw', wraplength=130)
@@ -653,6 +730,11 @@ def showImage(image_defs, sw, sh, switch_infos=None):
             overlay_set_visible[0](lines_visible[0])
     lines_btn.config(command=toggle_lines)
 
+    def toggle_coords_palette():
+        coords_active[0] = not coords_active[0]
+        coords_btn.config(text='Coords ✓' if coords_active[0] else 'Coords')
+    coords_btn.config(command=toggle_coords_palette)
+
     if sync_btn is not None:
         def toggle_sync():
             scroll_synced[0] = not scroll_synced[0]
@@ -662,9 +744,16 @@ def showImage(image_defs, sw, sh, switch_infos=None):
     def openOrReuseLineplot(mode):
         import matplotlib.figure as mfig
         state = plot_states[mode]
-        x_label = 'Row index' if mode == 'col' else 'Column index'
         WIN_W = 800
-        BTN_H = 80  # button row (46) + axis-control row (34)
+        BTN_H = 80
+        x_label_idx = 'Row index' if mode == 'col' else 'Column index'
+
+        def _cur_xlabel():
+            if coords_active[0]:
+                key = 'col_coord_label' if mode == 'col' else 'row_coord_label'
+                lbl = image_defs[0].get(key) if image_defs else None
+                return lbl if lbl else x_label_idx
+            return x_label_idx
 
         def _is_alive():
             w = state['win']
@@ -677,10 +766,11 @@ def showImage(image_defs, sw, sh, switch_infos=None):
 
         def _build_axes(fig, single):
             fig.clf()
+            xlabel = _cur_xlabel()
             if single:
                 ax = fig.add_subplot(1, 1, 1)
                 ax.grid(True, alpha=0.4)
-                ax.set_xlabel(x_label)
+                ax.set_xlabel(xlabel)
                 ax.set_ylabel('Value')
                 state['axes'] = [ax]
             else:
@@ -688,7 +778,7 @@ def showImage(image_defs, sw, sh, switch_infos=None):
                 for i, idef in enumerate(image_defs):
                     ax = fig.add_subplot(n_imgs, 1, i + 1)
                     ax.grid(True, alpha=0.4)
-                    ax.set_xlabel(x_label)
+                    ax.set_xlabel(xlabel)
                     ax.set_ylabel('Value')
                     ax.set_title(idef['title'], fontsize=8)
                     state['axes'].append(ax)
@@ -702,7 +792,7 @@ def showImage(image_defs, sw, sh, switch_infos=None):
 
         if not _is_alive():
             single = state['single']
-            WIN_H = 434 if single else 234 + 200 * n_imgs  # +34 for axis-control row
+            WIN_H = 434 if single else 234 + 200 * n_imgs
             x, y = nextPlotGeometry(WIN_W, WIN_H)
             win = tk.Toplevel()
             win.title('Column Plots' if mode == 'col' else 'Row Plots')
@@ -710,25 +800,38 @@ def showImage(image_defs, sw, sh, switch_infos=None):
             fig = mfig.Figure(figsize=(8, (WIN_H - BTN_H) / DPI), dpi=DPI)
             _build_axes(fig, single)
 
-            btn_frame = ttk.Frame(win)
-            btn_frame.pack(side='bottom', fill='x', padx=4, pady=6)
+            combined_frame = ttk.Frame(win)
+            combined_frame.pack(side='bottom', fill='x', padx=4, pady=4)
+            combined_frame.columnconfigure(1, weight=1)
+
+            # ---- col 0: action buttons ----
+            btn_frame = ttk.Frame(combined_frame)
+            btn_frame.grid(row=0, column=0, sticky='ns', padx=(0, 8))
 
             single_win_btn = ttk.Button(
-                btn_frame,
-                text='Single ✓' if single else 'Single')
+                btn_frame, text='Single ✓' if single else 'Single')
 
             def toggle_single_win():
                 state['single'] = not state['single']
                 single_win_btn.config(
                     text='Single ✓' if state['single'] else 'Single')
                 _clear_mode_overlays()
-                _build_axes(state['fig'], state['single'])
-                state['canvas'].draw()
                 new_h = 434 if state['single'] else 234 + 200 * n_imgs
+                state['fig'].set_size_inches(8, max(1.0, (new_h - BTN_H) / DPI))
+                _build_axes(state['fig'], state['single'])
+                history = list(state.get('history', []))
+                state['history'] = []
+                replay_fn = doColPlot if mode == 'col' else doRowPlot
+                for idx in history:
+                    replay_fn(idx)
+                apply_limits()
+                state['canvas'].draw()
+                if n_imgs > 1:
+                    _update_y_rows()
                 state['win'].geometry(f'{WIN_W}x{new_h}')
 
             single_win_btn.config(command=toggle_single_win)
-            single_win_btn.pack(side='left', padx=4)
+            single_win_btn.pack(side='top', fill='x', pady=1)
 
             def save_plot():
                 from tkinter import filedialog
@@ -748,36 +851,106 @@ def showImage(image_defs, sw, sh, switch_infos=None):
                     seen.add(id(ax))
                     ax.cla()
                     ax.grid(True, alpha=0.4)
-                    ax.set_xlabel(x_label)
+                    ax.set_xlabel(_cur_xlabel())
                     ax.set_ylabel('Value')
+                state['history'] = []
                 state['fig'].tight_layout()
                 state['canvas'].draw_idle()
                 _clear_mode_overlays()
 
-            ttk.Button(btn_frame, text='Save', command=save_plot).pack(side='left', padx=4)
-            ttk.Button(btn_frame, text='Clear', command=clear_plots).pack(side='left', padx=4)
-            ttk.Button(btn_frame, text='Close', command=win.destroy).pack(side='right', padx=4)
+            ttk.Button(btn_frame, text='Save', command=save_plot).pack(
+                side='top', fill='x', pady=1)
+            ttk.Button(btn_frame, text='Clear', command=clear_plots).pack(
+                side='top', fill='x', pady=1)
+            ttk.Button(btn_frame, text='Close', command=win.destroy).pack(
+                side='top', fill='x', pady=1)
 
-            ctrl_frame = ttk.Frame(win)
-            ctrl_frame.pack(side='bottom', fill='x', padx=4, pady=2)
+            # ---- col 1: range controls ----
+            ctrl_frame = ttk.Frame(combined_frame)
+            ctrl_frame.grid(row=0, column=1, sticky='nsew')
             log_y = [False]
-            ymin_var = tk.StringVar()
-            ymax_var = tk.StringVar()
+
+            y_vars = [(tk.StringVar(), tk.StringVar()) for _ in range(n_imgs)]
             xmin_var = tk.StringVar()
             xmax_var = tk.StringVar()
-            ttk.Label(ctrl_frame, text='Y:').pack(side='left')
-            ttk.Entry(ctrl_frame, textvariable=ymin_var, width=8).pack(side='left', padx=(0, 2))
-            ttk.Label(ctrl_frame, text='to').pack(side='left')
-            ttk.Entry(ctrl_frame, textvariable=ymax_var, width=8).pack(side='left', padx=(0, 10))
-            ttk.Label(ctrl_frame, text='X:').pack(side='left')
-            ttk.Entry(ctrl_frame, textvariable=xmin_var, width=8).pack(side='left', padx=(0, 2))
-            ttk.Label(ctrl_frame, text='to').pack(side='left')
-            ttk.Entry(ctrl_frame, textvariable=xmax_var, width=8).pack(side='left', padx=(0, 10))
+            bias_vars = [tk.StringVar(value='0') for _ in range(n_imgs)]
+            state['bias_vars'] = bias_vars
+
+            if n_imgs > 1:
+                # One Y row per subplot; show all in multi mode, only first in single mode
+                y_rows_frames = []
+                for idx in range(n_imgs):
+                    ymin_v, ymax_v = y_vars[idx]
+                    y_row = ttk.Frame(ctrl_frame)
+                    lbl_w = ttk.Label(y_row, text=f'Y{idx + 1}:')
+                    lbl_w.pack(side='left')
+                    ttk.Entry(y_row, textvariable=ymin_v, width=8).pack(
+                        side='left', padx=(0, 2))
+                    ttk.Label(y_row, text='to').pack(side='left')
+                    ttk.Entry(y_row, textvariable=ymax_v, width=8).pack(
+                        side='left', padx=(0, 10))
+                    y_rows_frames.append((y_row, lbl_w))
+                x_row = ttk.Frame(ctrl_frame)
+                ttk.Label(x_row, text='X:').pack(side='left')
+                ttk.Entry(x_row, textvariable=xmin_var, width=8).pack(
+                    side='left', padx=(0, 2))
+                ttk.Label(x_row, text='to').pack(side='left')
+                ttk.Entry(x_row, textvariable=xmax_var, width=8).pack(
+                    side='left', padx=(0, 10))
+
+                def _update_y_rows():
+                    is_s = state['single']
+                    for fr, lbl_w in y_rows_frames:
+                        fr.pack_forget()
+                    x_row.pack_forget()
+                    for idx, (fr, lbl_w) in enumerate(y_rows_frames):
+                        if is_s and idx > 0:
+                            continue
+                        lbl_w.config(text='Y:' if is_s else f'Y{idx + 1}:')
+                        fr.pack(fill='x', pady=(0, 1))
+                    x_row.pack(fill='x')
+
+                _update_y_rows()
+            else:
+                # n_imgs == 1: Y and X on one row
+                bot_row = ttk.Frame(ctrl_frame)
+                bot_row.pack(fill='x')
+                ymin_v0, ymax_v0 = y_vars[0]
+                ttk.Label(bot_row, text='Y:').pack(side='left')
+                ttk.Entry(bot_row, textvariable=ymin_v0, width=8).pack(
+                    side='left', padx=(0, 2))
+                ttk.Label(bot_row, text='to').pack(side='left')
+                ttk.Entry(bot_row, textvariable=ymax_v0, width=8).pack(
+                    side='left', padx=(0, 10))
+                ttk.Label(bot_row, text='X:').pack(side='left')
+                ttk.Entry(bot_row, textvariable=xmin_var, width=8).pack(
+                    side='left', padx=(0, 2))
+                ttk.Label(bot_row, text='to').pack(side='left')
+                ttk.Entry(bot_row, textvariable=xmax_var, width=8).pack(
+                    side='left', padx=(0, 10))
+
+                def _update_y_rows():
+                    pass  # no-op for single image
+
+            # Bias row — always visible, one entry per image regardless of single/multi mode
+            bias_row = ttk.Frame(ctrl_frame)
+            bias_row.pack(fill='x', pady=(0, 1))
+            for idx in range(n_imgs):
+                lbl = f'B{idx + 1}:' if n_imgs > 1 else 'B:'
+                ttk.Label(bias_row, text=lbl).pack(side='left')
+                ttk.Entry(bias_row, textvariable=bias_vars[idx], width=6).pack(
+                    side='left', padx=(0, 8))
+
+            remove_mean = [False]
+            state['remove_mean'] = remove_mean
 
             def apply_limits():
-                for ax in state['axes']:
+                axes = state['axes']
+                is_single_ax = len(axes) == 1
+                for i, ax in enumerate(axes):
+                    ymin_v, ymax_v = y_vars[0] if is_single_ax else y_vars[i]
                     try:
-                        ax.set_ylim(float(ymin_var.get()), float(ymax_var.get()))
+                        ax.set_ylim(float(ymin_v.get()), float(ymax_v.get()))
                     except ValueError:
                         pass
                     try:
@@ -787,17 +960,21 @@ def showImage(image_defs, sw, sh, switch_infos=None):
                 state['canvas'].draw_idle()
 
             def auto_limits():
-                for ax in state['axes']:
+                axes = state['axes']
+                is_single_ax = len(axes) == 1
+                for ax in axes:
                     ax.set_ylim(auto=True)
                     ax.set_xlim(auto=True)
                     ax.relim()
                     ax.autoscale_view()
                 state['canvas'].draw_idle()
-                if state['axes']:
-                    lo, hi = state['axes'][0].get_ylim()
-                    ymin_var.set(f'{lo:.4g}')
-                    ymax_var.set(f'{hi:.4g}')
-                    lo, hi = state['axes'][0].get_xlim()
+                for i, ax in enumerate(axes):
+                    lo, hi = ax.get_ylim()
+                    ymin_v, ymax_v = y_vars[0] if is_single_ax else y_vars[i]
+                    ymin_v.set(f'{lo:.4g}')
+                    ymax_v.set(f'{hi:.4g}')
+                if axes:
+                    lo, hi = axes[0].get_xlim()
                     xmin_var.set(f'{lo:.4g}')
                     xmax_var.set(f'{hi:.4g}')
 
@@ -811,85 +988,205 @@ def showImage(image_defs, sw, sh, switch_infos=None):
                     ax.set_yscale(scale)
                 state['canvas'].draw_idle()
 
-            ttk.Button(ctrl_frame, text='Apply', command=apply_limits).pack(side='left', padx=2)
-            ttk.Button(ctrl_frame, text='Auto', command=auto_limits).pack(side='left', padx=2)
-            log_btn = ttk.Button(ctrl_frame, text='Log Y', command=toggle_log_y)
+            action_row = ttk.Frame(ctrl_frame)
+            action_row.pack(fill='x', pady=(2, 0))
+            ttk.Button(action_row, text='Apply', command=apply_limits).pack(
+                side='left', padx=2)
+            ttk.Button(action_row, text='Auto', command=auto_limits).pack(
+                side='left', padx=2)
+            log_btn = ttk.Button(action_row, text='Log Y', command=toggle_log_y)
             log_btn.pack(side='left', padx=2)
             log_btn_ref[0] = log_btn
+
+            rm_btn_ref = [None]
+
+            def toggle_remove_mean():
+                remove_mean[0] = not remove_mean[0]
+                rm_btn_ref[0].config(text='Rm Mean ✓' if remove_mean[0] else 'Rm Mean')
+                history = list(state.get('history', []))
+                if not history:
+                    return
+                seen = set()
+                for i, ax in enumerate(state['axes'] or []):
+                    if id(ax) in seen:
+                        continue
+                    seen.add(id(ax))
+                    ax.cla()
+                    ax.grid(True, alpha=0.4)
+                    ax.set_xlabel(_cur_xlabel())
+                    ax.set_ylabel('Value')
+                    if not state['single'] and n_imgs > 1 and i < len(image_defs):
+                        ax.set_title(image_defs[i]['title'], fontsize=8)
+                state['history'] = []
+                replay_fn = doColPlot if mode == 'col' else doRowPlot
+                for idx in history:
+                    replay_fn(idx)
+
+            rm_btn = ttk.Button(action_row, text='Rm Mean', command=toggle_remove_mean)
+            rm_btn.pack(side='left', padx=2)
+            rm_btn_ref[0] = rm_btn
 
             canvas = FigureCanvasTkAgg(fig, master=win)
             canvas.draw()
             canvas.get_tk_widget().pack(fill='both', expand=True)
-            state.update({'win': win, 'fig': fig, 'canvas': canvas})
+            state.update({'win': win, 'fig': fig, 'canvas': canvas,
+                          'bias_vars': bias_vars, 'remove_mean': remove_mean})
 
         return state['axes'], state['fig'], state['canvas']
 
     def doColPlot(col):
         axes, fig, canvas = openOrReuseLineplot('col')
+        state = plot_states['col']
+        state.setdefault('history', []).append(col)
+        bias_vars_c = state.get('bias_vars') or []
+        rm_mean = state.get('remove_mean', [False])[0]
+        use_c = coords_active[0]
         colors = []
-        single = plot_states['col']['single']
+        single = state['single']
+        bad_bias = []
         for i, idef in enumerate(image_defs):
             dec = idef.get('raw', idef['dec'])
             if col >= dec.shape[1]:
                 colors.append(None)
                 continue
+            try:
+                bias = float(bias_vars_c[i].get()) if i < len(bias_vars_c) else 0.0
+            except ValueError:
+                bias = 0.0
+                bad_bias.append(i + 1)
             ax = axes[0] if single else axes[i]
             pfx = f'{i+1}: ' if single else ''
             rows_i = np.arange(dec.shape[0])
+            if use_c:
+                ccoords = idef.get('col_coords')
+                x_arr = (ccoords if ccoords is not None and len(ccoords) == len(rows_i)
+                         else rows_i)
+            else:
+                x_arr = rows_i
             if dec.ndim == 2:
-                line, = ax.plot(rows_i, dec[:, col], label=f'{pfx}col {col}')
+                data = dec[:, col].astype(float)
+                if rm_mean:
+                    data -= np.nanmean(data)
+                data += bias
+                line, = ax.plot(x_arr, data, label=f'{pfx}col {col}')
                 colors.append(line.get_color())
             else:
-                plotted = [ax.plot(rows_i, dec[:, col, j],
-                                   label=f'{pfx}col {col} {ch}')[0]
-                           for j, ch in enumerate(('R', 'G', 'B')[:dec.shape[2]])]
+                plotted = []
+                for j, ch in enumerate(('R', 'G', 'B')[:dec.shape[2]]):
+                    data = dec[:, col, j].astype(float)
+                    if rm_mean:
+                        data -= np.nanmean(data)
+                    data += bias
+                    plotted.append(ax.plot(x_arr, data,
+                                           label=f'{pfx}col {col} {ch}')[0])
                 colors.append(plotted[0].get_color())
             ax.legend(fontsize=7)
+        # Sync x-axis across subplots when all images have the same row count
+        if not single and len(axes) > 1:
+            sizes = [idef.get('raw', idef['dec']).shape[0] for idef in image_defs]
+            if len(set(sizes)) == 1:
+                active = [ax for ax in axes if ax.lines]
+                if active:
+                    x0 = min(ax.get_xlim()[0] for ax in active)
+                    x1 = max(ax.get_xlim()[1] for ax in active)
+                    for ax in axes:
+                        ax.set_xlim(x0, x1)
         fig.tight_layout()
         canvas.draw_idle()
-        status_var.set(f'  plotted col {col}')
+        msg = f'  plotted col {col}'
+        if bad_bias:
+            msg += f'  (invalid bias for P{",".join(map(str, bad_bias))} — using 0)'
+        status_var.set(msg)
         return colors
 
     def doRowPlot(row):
         axes, fig, canvas = openOrReuseLineplot('row')
+        state = plot_states['row']
+        state.setdefault('history', []).append(row)
+        bias_vars_r = state.get('bias_vars') or []
+        rm_mean = state.get('remove_mean', [False])[0]
+        use_c = coords_active[0]
         colors = []
-        single = plot_states['row']['single']
+        single = state['single']
+        data_row = row
+        bad_bias = []
         for i, idef in enumerate(image_defs):
             dec = idef.get('raw', idef['dec'])
-            if row >= dec.shape[0]:
+            ol = idef.get('origin_lower', False)
+            drow = (dec.shape[0] - 1 - row) if ol else row
+            if i == 0:
+                data_row = drow
+            if drow >= dec.shape[0]:
                 colors.append(None)
                 continue
+            try:
+                bias = float(bias_vars_r[i].get()) if i < len(bias_vars_r) else 0.0
+            except ValueError:
+                bias = 0.0
+                bad_bias.append(i + 1)
             ax = axes[0] if single else axes[i]
             pfx = f'{i+1}: ' if single else ''
             cols_i = np.arange(dec.shape[1])
+            if use_c:
+                rcoords = idef.get('row_coords')
+                x_arr = (rcoords if rcoords is not None and len(rcoords) == len(cols_i)
+                         else cols_i)
+            else:
+                x_arr = cols_i
             if dec.ndim == 2:
-                line, = ax.plot(cols_i, dec[row, :],
-                                label=f'{pfx}row {row}')
+                data = dec[drow, :].astype(float)
+                if rm_mean:
+                    data -= np.nanmean(data)
+                data += bias
+                line, = ax.plot(x_arr, data, label=f'{pfx}row {drow}')
                 colors.append(line.get_color())
             else:
-                plotted = [ax.plot(cols_i, dec[row, :, j],
-                                   label=f'{pfx}row {row} {ch}')[0]
-                           for j, ch in enumerate(('R', 'G', 'B')[:dec.shape[2]])]
+                plotted = []
+                for j, ch in enumerate(('R', 'G', 'B')[:dec.shape[2]]):
+                    data = dec[drow, :, j].astype(float)
+                    if rm_mean:
+                        data -= np.nanmean(data)
+                    data += bias
+                    plotted.append(ax.plot(x_arr, data,
+                                           label=f'{pfx}row {drow} {ch}')[0])
                 colors.append(plotted[0].get_color())
             ax.legend(fontsize=7)
+        # Sync x-axis across subplots when all images have the same col count
+        if not single and len(axes) > 1:
+            sizes = [idef.get('raw', idef['dec']).shape[1] for idef in image_defs]
+            if len(set(sizes)) == 1:
+                active = [ax for ax in axes if ax.lines]
+                if active:
+                    x0 = min(ax.get_xlim()[0] for ax in active)
+                    x1 = max(ax.get_xlim()[1] for ax in active)
+                    for ax in axes:
+                        ax.set_xlim(x0, x1)
         fig.tight_layout()
         canvas.draw_idle()
-        status_var.set(f'  plotted row {row}')
+        msg = f'  plotted row {row}'
+        if bad_bias:
+            msg += f'  (invalid bias for P{",".join(map(str, bad_bias))} — using 0)'
+        status_var.set(msg)
         return colors
 
     def report_pick(col, row):
         val_parts = []
+        data_row = row
         for i, idef in enumerate(image_defs):
             dec = idef.get('raw', idef['dec'])
-            if 0 <= row < dec.shape[0] and 0 <= col < dec.shape[1]:
+            ol = idef.get('origin_lower', False)
+            drow = (dec.shape[0] - 1 - row) if ol else row
+            if i == 0:
+                data_row = drow
+            if 0 <= drow < dec.shape[0] and 0 <= col < dec.shape[1]:
                 if dec.ndim == 2:
-                    val_parts.append(f'val{i+1}={dec[row, col]:.6g}')
+                    val_parts.append(f'val{i+1}={dec[drow, col]:.6g}')
                 else:
                     val_parts.append(f'val{i+1}='
-                                     + '/'.join(f'{v:.4g}' for v in dec[row, col]))
+                                     + '/'.join(f'{v:.4g}' for v in dec[drow, col]))
             else:
                 val_parts.append(f'val{i+1}=OOB')
-        status_var.set(f'col={col}\nrow={row}\n' + '   '.join(val_parts))
+        status_var.set(f'col={col}\nrow={data_row}\n' + '   '.join(val_parts))
 
     next_plot_y = [None]
 
@@ -898,7 +1195,10 @@ def showImage(image_defs, sw, sh, switch_infos=None):
         px = root.winfo_x()
         py = root.winfo_y()
         pw = root.winfo_width()
-        x = max(0, min(px + pw + 10, sw - win_w))
+        if rtl:
+            x = max(0, min(px - win_w - 10, sw - win_w))
+        else:
+            x = max(0, min(px + pw + 10, sw - win_w))
         if next_plot_y[0] is None:
             next_plot_y[0] = py
         y = max(0, min(next_plot_y[0], sh - win_h))
@@ -910,14 +1210,19 @@ def showImage(image_defs, sw, sh, switch_infos=None):
     # ---- image area: N canvases side by side, synchronized scrolling ----
     palette.update_idletasks()
     PAL_W = palette.winfo_reqwidth()
-    PAL_X, PAL_Y = 10, 10
-    IMG_X = PAL_X + PAL_W + 5
+    PAL_Y = 10
+    if rtl:
+        PAL_X = sw - PAL_W - 10
+        IMG_X = None  # real value depends on win_w, set once it's known below
+    else:
+        PAL_X = 10
+        IMG_X = PAL_X + PAL_W + 5
     IMG_Y = PAL_Y
 
     PLOT_WIN_W = 800
     cbar_w_total = sum(CBAR_PX if not d['is_rgb'] else 0 for d in image_defs)
     cbar_per_img = max(CBAR_PX if not d['is_rgb'] else 0 for d in image_defs)
-    img_area_w = sw - IMG_X - PLOT_WIN_W - 20
+    img_area_w = sw - PAL_W - PLOT_WIN_W - 35
     usable_h = sh - IMG_Y - DECO_H
 
     # Compute viewport dimensions for both stacking orientations, pick larger area
@@ -954,8 +1259,8 @@ def showImage(image_defs, sw, sh, switch_infos=None):
     outer.pack(fill='both', expand=True)
 
     for i, idef in enumerate(image_defs):
-        photo = decToPhoto(idef['dec'], idef['cmap'], idef['vmin'], idef['vmax'],
-                           idef['is_rgb'])
+        photo = decToPhoto(_disp(idef['dec'], idef.get('origin_lower', False)),
+                           idef['cmap'], idef['vmin'], idef['vmax'], idef['is_rgb'])
         img_frame = ttk.Frame(outer)
         img_frame.pack(side='left' if stack_horiz else 'top', fill='both', expand=True)
 
@@ -1088,8 +1393,13 @@ def showImage(image_defs, sw, sh, switch_infos=None):
                 draw_marker(col, row)
                 p0, p1 = profile_pts
                 draw_profile_line(p0[1], p0[0], p1[1], p1[0])
-                dv        = [extractProfile(d.get('raw', d['dec']), p0[0], p0[1], p1[0], p1[1])
-                             for d in image_defs]
+                dv = []
+                for d in image_defs:
+                    dec_d = d.get('raw', d['dec'])
+                    ol_d = d.get('origin_lower', False)
+                    dr0 = (dec_d.shape[0] - 1 - p0[0]) if ol_d else p0[0]
+                    dr1 = (dec_d.shape[0] - 1 - p1[0]) if ol_d else p1[0]
+                    dv.append(extractProfile(dec_d, dr0, p0[1], dr1, p1[1]))
                 dist      = dv[0][0]
                 vals_list = [x[1] for x in dv]
                 titles    = [d['title'] for d in image_defs]
@@ -1113,33 +1423,81 @@ def showImage(image_defs, sw, sh, switch_infos=None):
 
     # ---- colormap selector callback ----
     def apply_cmap(event=None):
-        import matplotlib.cm as mcm
-        import matplotlib.colors as mcolors
         new_cmap = cmap_var.get()
         for idef, ref in zip(image_defs, pane_refs):
             if idef['is_rgb']:
                 continue
             idef['cmap'] = new_cmap
-            new_photo = decToPhoto(idef.get('raw', idef['dec']), new_cmap,
-                                   idef['vmin'], idef['vmax'], False)
+            new_photo = decToPhoto(_disp(idef.get('raw', idef['dec']),
+                                         idef.get('origin_lower', False)),
+                                   new_cmap, idef['vmin'], idef['vmax'], False)
             ref['canvas'].itemconfigure(ref['img_item'], image=new_photo)
             ref['canvas'].image = new_photo
-            if ref['cbar_fig'] is not None:
-                ref['cbar_fig'].clear()
-                cax = ref['cbar_fig'].add_axes([0.25, 0.05, 0.35, 0.9])
-                sm = mcm.ScalarMappable(
-                    cmap=mcm.get_cmap(new_cmap),
-                    norm=mcolors.Normalize(vmin=idef['vmin'], vmax=idef['vmax']))
-                sm.set_array([])
-                ref['cbar_fig'].colorbar(sm, cax=cax)
-                ref['cbar_cv'].draw()
+            _rebuildColorbar(ref, new_cmap, idef['vmin'], idef['vmax'])
     cmap_combo.bind('<<ComboboxSelected>>', apply_cmap)
+
+    # ---- common vmin/vmax across all non-RGB panes (toggle) ----
+    common_scale_active = [False]
+    _orig_scales = []
+
+    def apply_common_scale(event=None):
+        targets = [(idef, ref) for idef, ref in zip(image_defs, pane_refs)
+                   if not idef['is_rgb']]
+        if not targets:
+            return
+
+        def _redraw(idef, ref, vmin, vmax):
+            new_photo = decToPhoto(_disp(idef.get('raw', idef['dec']),
+                                         idef.get('origin_lower', False)),
+                                   idef['cmap'], vmin, vmax, False)
+            ref['canvas'].itemconfigure(ref['img_item'], image=new_photo)
+            ref['canvas'].image = new_photo
+            _rebuildColorbar(ref, idef['cmap'], vmin, vmax)
+
+        if common_scale_active[0]:
+            for (idef, ref), (ovmin, ovmax) in zip(targets, _orig_scales):
+                idef['vmin'] = ovmin
+                idef['vmax'] = ovmax
+                _redraw(idef, ref, ovmin, ovmax)
+            _orig_scales.clear()
+            common_scale_active[0] = False
+            common_scale_btn.config(text='Common Scale')
+            status_var.set('Restored original scales')
+            return
+
+        vmin_str = common_vmin_var.get().strip()
+        vmax_str = common_vmax_var.get().strip()
+        try:
+            vmin = (float(vmin_str) if vmin_str
+                    else min(idef['vmin'] for idef, _ in targets))
+            vmax = (float(vmax_str) if vmax_str
+                    else max(idef['vmax'] for idef, _ in targets))
+        except ValueError:
+            status_var.set('Common scale: invalid min/max')
+            return
+
+        _orig_scales.clear()
+        for idef, ref in targets:
+            _orig_scales.append((idef['vmin'], idef['vmax']))
+            idef['vmin'] = vmin
+            idef['vmax'] = vmax
+            _redraw(idef, ref, vmin, vmax)
+        common_vmin_var.set(f'{vmin:.4g}')
+        common_vmax_var.set(f'{vmax:.4g}')
+        common_scale_active[0] = True
+        common_scale_btn.config(text='Restore Scale')
+        status_var.set(f'Common scale: [{vmin:.4g}, {vmax:.4g}]')
+
+    if common_scale_btn is not None:
+        common_scale_btn.config(command=apply_common_scale)
+        _cs_min_ent.bind('<Return>', apply_common_scale)
+        _cs_min_ent.bind('<KP_Enter>', apply_common_scale)
+        _cs_max_ent.bind('<Return>', apply_common_scale)
+        _cs_max_ent.bind('<KP_Enter>', apply_common_scale)
 
     # ---- mod applier (per pane) ----
     def make_mod_applier(p_idx):
         def apply_mod(event=None):
-            import matplotlib.cm as mcm
-            import matplotlib.colors as mcolors
             entry_info = mod_entries[p_idx]
             if entry_info is None:
                 return
@@ -1167,18 +1525,11 @@ def showImage(image_defs, sw, sh, switch_infos=None):
             idef['mod_val'] = mod_v
             idef['vmin'] = vmin
             idef['vmax'] = vmax
-            new_photo = decToPhoto(dec, idef['cmap'], vmin, vmax, False)
+            new_photo = decToPhoto(_disp(dec, idef.get('origin_lower', False)),
+                                   idef['cmap'], vmin, vmax, False)
             ref['canvas'].itemconfigure(ref['img_item'], image=new_photo)
             ref['canvas'].image = new_photo
-            if ref['cbar_fig'] is not None:
-                ref['cbar_fig'].clear()
-                cax = ref['cbar_fig'].add_axes([0.25, 0.05, 0.35, 0.9])
-                sm = mcm.ScalarMappable(
-                    cmap=mcm.get_cmap(idef['cmap']),
-                    norm=mcolors.Normalize(vmin=vmin, vmax=vmax))
-                sm.set_array([])
-                ref['cbar_fig'].colorbar(sm, cax=cax)
-                ref['cbar_cv'].draw()
+            _rebuildColorbar(ref, idef['cmap'], vmin, vmax)
             status_var.set(f'P{p_idx+1}: mod={mod_v}')
         return apply_mod
 
@@ -1192,8 +1543,6 @@ def showImage(image_defs, sw, sh, switch_infos=None):
 
     # ---- band switching (per pane) ----
     if switch_infos is not None and any(si is not None for si in switch_infos):
-        import matplotlib.cm as mcm
-        import matplotlib.colors as mcolors
         ttk.Separator(btn_col, orient='horizontal').pack(fill='x', pady=(6, 2))
 
         def make_band_switcher(bname, bnum, p_idef, p_ref, p_si, p_idx):
@@ -1203,8 +1552,20 @@ def showImage(image_defs, sw, sh, switch_infos=None):
                     base_dec = cache[bname]
                 else:
                     if 'ds' in p_si:
-                        base_dec = blockAverage(
-                            readBand(p_si['ds'], bnum), p_si['factor'])
+                        band_arr = readBand(p_si['ds'], bnum)
+                        m_arr = p_si.get('mask_arr')
+                        if m_arr is not None:
+                            if m_arr.shape[:2] == band_arr.shape[:2]:
+                                band_arr = band_arr.astype(np.float32, copy=True)
+                                if p_si.get('mask_invert'):
+                                    band_arr[m_arr != 0] = np.nan
+                                else:
+                                    band_arr[m_arr == 0] = np.nan
+                            else:
+                                print(f'showimage: mask shape {m_arr.shape[:2]} does not '
+                                      f'match image shape {band_arr.shape[:2]} — skipping mask',
+                                      file=sys.stderr)
+                        base_dec = blockAverage(band_arr, p_si['factor'])
                     else:
                         base_dec = blockAverage(
                             p_si['loaders'][bname](), p_si['factor'])
@@ -1222,21 +1583,32 @@ def showImage(image_defs, sw, sh, switch_infos=None):
                     mod_v if mod_v is not None else np.nanpercentile(dec, 98))
                 p_idef.update({'dec': dec, 'base': base_dec,
                                'vmin': vmin, 'vmax': vmax, 'title': bname})
-                new_photo = decToPhoto(dec, p_si['cmap'], vmin, vmax, False)
+                new_photo = decToPhoto(_disp(dec, p_idef.get('origin_lower', False)),
+                                       p_si['cmap'], vmin, vmax, False)
                 p_ref['canvas'].itemconfigure(p_ref['img_item'], image=new_photo)
                 p_ref['canvas'].image = new_photo
-                if p_ref['cbar_fig'] is not None:
-                    p_ref['cbar_fig'].clear()
-                    cax = p_ref['cbar_fig'].add_axes([0.25, 0.05, 0.35, 0.9])
-                    sm = mcm.ScalarMappable(
-                        cmap=mcm.get_cmap(p_si['cmap']),
-                        norm=mcolors.Normalize(vmin=vmin, vmax=vmax))
-                    sm.set_array([])
-                    p_ref['cbar_fig'].colorbar(sm, cax=cax)
-                    p_ref['cbar_cv'].draw()
+                _rebuildColorbar(p_ref, p_si['cmap'], vmin, vmax)
                 p_ref['title_lbl'].config(text=f'{p_idx+1}) {bname}')
                 if n_imgs == 1:
                     root.title(f'1) {bname}')
+                # refresh the diff/sum pane if one exists
+                d_idef = image_defs[-1]
+                if d_idef.get('is_diff') and len(pane_refs) == len(image_defs):
+                    d_ref = pane_refs[-1]
+                    d_add = d_idef['add_mode']
+                    d_op = '+' if d_add else '−'
+                    d_arr, d_sc, d_stats = _computeDiffArray(
+                        image_defs[0]['base'], image_defs[1]['base'], d_add)
+                    d_title = f'P1 {d_op} P2    {d_stats}'
+                    d_idef.update({'dec': d_arr, 'base': d_arr,
+                                   'vmin': -d_sc, 'vmax': d_sc, 'title': d_title})
+                    d_photo = decToPhoto(
+                        _disp(d_arr, d_idef.get('origin_lower', False)),
+                        'RdBu', -d_sc, d_sc, False)
+                    d_ref['canvas'].itemconfigure(d_ref['img_item'], image=d_photo)
+                    d_ref['canvas'].image = d_photo
+                    _rebuildColorbar(d_ref, 'RdBu', -d_sc, d_sc)
+                    d_ref['title_lbl'].config(text=f'{len(image_defs)}) {d_title}')
                 status_var.set(f'Pane {p_idx+1} band: {bname}')
             return switch
 
@@ -1254,7 +1626,7 @@ def showImage(image_defs, sw, sh, switch_infos=None):
                            command=make_band_switcher(bname, bnum, idef, ref, si, p_idx)).pack(
                     side='top', fill='x', pady=1, padx=2)
 
-    # ---- position palette at left, image window to the right ----
+    # ---- position palette (right edge if rtl, else left), image window adjacent ----
     win_h_max = sh - IMG_Y - DECO_H
     if stack_horiz:
         win_w = n_imgs * (viewport_w + SCROLLBAR_W) + cbar_w_total
@@ -1263,11 +1635,127 @@ def showImage(image_defs, sw, sh, switch_infos=None):
         win_w = viewport_w + SCROLLBAR_W + cbar_per_img
         win_h = min(n_imgs * (LABEL_H + viewport_h + SCROLLBAR_W), win_h_max)
 
+    if rtl:
+        IMG_X = max(0, PAL_X - 5 - win_w)
     status_lbl.config(wraplength=max(60, PAL_W - 12))
-    palette.geometry(f'{PAL_W}x{win_h}+{PAL_X}+{PAL_Y}')
+    palette.update_idletasks()
+    pal_h = min(palette.winfo_reqheight(), win_h_max)
+    palette.geometry(f'{PAL_W}x{pal_h}+{PAL_X}+{PAL_Y}')
     root.geometry(f'{win_w}x{win_h}+{IMG_X}+{IMG_Y}')
 
     root.mainloop()
+
+
+def _computeDiffArray(a, b, add_mode):
+    """Return (diff, scale, stats_str) for a P1-vs-P2 difference (or sum) pane."""
+    op = '+' if add_mode else '−'
+    diff = a + b if add_mode else a - b
+    finite = diff[np.isfinite(diff)]
+    scale = float(np.nanpercentile(np.abs(finite), 98)) if finite.size else 1.0
+    if scale == 0:
+        scale = 1.0
+    if finite.size:
+        mean = float(np.nanmean(finite))
+        std  = float(np.nanstd(finite))
+        rms  = float(np.sqrt(np.nanmean(finite ** 2)))
+        dmin = float(finite.min())
+        dmax = float(finite.max())
+        stats_str = (f'mean={mean:.4g}  std={std:.4g}  rms={rms:.4g}'
+                     f'  min={dmin:.4g}  max={dmax:.4g}')
+        print(f'Diff (P1 {op} P2):  {stats_str}  (n={finite.size:,})')
+    else:
+        stats_str = 'no valid pixels'
+        print(f'Diff (P1 {op} P2):  no valid pixels')
+    return diff, scale, stats_str
+
+
+def _injectDiff(image_defs, add_mode):
+    """Append a difference (or sum) pane from the first two entries of image_defs."""
+    a = image_defs[0]['base']
+    b = image_defs[1]['base']
+    if a.shape != b.shape:
+        sys.exit(f'--diff: image shapes differ ({a.shape} vs {b.shape}); '
+                 'both inputs must be the same size')
+    diff, scale, stats_str = _computeDiffArray(a, b, add_mode)
+    op = '+' if add_mode else '−'
+    image_defs.append({
+        'dec': diff,
+        'base': diff,
+        'mod_val': None,
+        'vmin_arg': None,
+        'vmax_arg': None,
+        'title': f'P1 {op} P2    {stats_str}',
+        'cmap': 'RdBu',
+        'vmin': -scale,
+        'vmax': scale,
+        'col_coords': image_defs[0].get('col_coords'),
+        'row_coords': image_defs[0].get('row_coords'),
+        'col_coord_label': image_defs[0].get('col_coord_label'),
+        'row_coord_label': image_defs[0].get('row_coord_label'),
+        'origin_lower': image_defs[0].get('origin_lower', False),
+        'is_rgb': False,
+        'is_diff': True,
+        'add_mode': add_mode,
+    })
+
+
+def resolveFilename(f):
+    """Return (resolved_path, is_geodat).
+
+    If f exists and GDAL can open it, return (f, False).
+    Otherwise try, in priority order, f+'.vrt', f+'.tif', f+'.h5'/'.he5'/'.hdf5'
+    (NISAR), then check for f+'.geodat' sidecar (geoimage scalar: data in f,
+    metadata in f.geodat).
+    Exits with an error if nothing is found.
+    """
+    if os.path.exists(f):
+        if gdal is None:
+            return f, False
+        gdal.PushErrorHandler('CPLQuietErrorHandler')
+        try:
+            ds = gdal.Open(f)
+        except Exception:
+            ds = None
+        finally:
+            gdal.PopErrorHandler()
+        if ds is not None:
+            ds = None
+            return f, False
+    for ext in ('.vrt', '.tif', '.h5', '.he5', '.hdf5'):
+        cand = f + ext
+        if os.path.exists(cand):
+            return cand, False
+    if os.path.exists(f + '.geodat'):
+        return f, True
+    sys.exit(f'showimage: cannot find {f!r} '
+             f'(tried {f}.vrt, {f}.tif, {f}.h5; geodat sidecar {f}.geodat not found)')
+
+
+def geodatToGdalMem(f):
+    """Read a GrIMP scalar geodat binary image and return a GDAL MEM dataset."""
+    try:
+        from utilities.geoimage import geoimage as Geoimage
+    except ImportError:
+        sys.exit('showimage: utilities.geoimage not available — cannot read geodat files')
+    gi = Geoimage(verbose=False)
+    try:
+        gi.readData(f, geoType='scalar')
+    except Exception as exc:
+        sys.exit(f'showimage: cannot read geodat image {f!r}: {exc}')
+    arr = np.asarray(gi.x, dtype=np.float32)
+    ny, nx = arr.shape
+    x0 = float(gi.xx[0]) * 1000.0
+    dx = float(gi.xx[1] - gi.xx[0]) * 1000.0 if nx > 1 else 1.0
+    y0 = float(gi.yy[0]) * 1000.0
+    dy = float(gi.yy[1] - gi.yy[0]) * 1000.0 if ny > 1 else -1.0
+    gt = (x0, dx, 0.0, y0, 0.0, dy)
+    driver = gdal.GetDriverByName('MEM')
+    mem_ds = driver.Create('', nx, ny, 1, gdal.GDT_Float32)
+    mem_ds.SetGeoTransform(gt)
+    band = mem_ds.GetRasterBand(1)
+    band.WriteArray(arr)
+    band.SetNoDataValue(-2e9)
+    return mem_ds
 
 
 def main():
@@ -1310,6 +1798,29 @@ def main():
     parser.add_argument('--noCache', action='store_true',
                         help='Disable decimated-band cache (reduces memory use; '
                              're-reads from disk on each band switch)')
+    parser.add_argument('--right', action='store_true',
+                        help='Place the control palette at the right edge of the '
+                             'screen, with the image and plot/profile windows '
+                             'opening to its left (mirrors the default left-to-right '
+                             'layout) — lets a second instance run without '
+                             'overlapping the first')
+    _diff_group = parser.add_mutually_exclusive_group()
+    _diff_group.add_argument('--diff', action='store_true',
+                        help='Show two images and their difference as a third pane '
+                             '(pane 3 = pane 1 − pane 2, RdBu colormap, auto-scaled '
+                             'symmetrically). Requires exactly 2 files or 2 --bands.')
+    _diff_group.add_argument('--add', action='store_true',
+                        help='Show two images and their sum as a third pane '
+                             '(pane 3 = pane 1 + pane 2, RdBu colormap, auto-scaled '
+                             'symmetrically). Requires exactly 2 files or 2 --bands.')
+    _mask_group = parser.add_mutually_exclusive_group()
+    _mask_group.add_argument('--mask', default=None, metavar='MASKFILE',
+                        help='Single-band mask file; pixels where the mask is 0 are '
+                             'set to noData in all displayed images')
+    _mask_group.add_argument('--invMask', default=None, metavar='MASKFILE',
+                        help='Single-band mask file; pixels where the mask is non-zero '
+                             'are set to noData in all displayed images '
+                             '(opposite of --mask)')
     args = parser.parse_args()
 
     if args.vel and len(args.files) != 1:
@@ -1322,8 +1833,26 @@ def main():
         sys.exit('--bands requires exactly one input file')
     if args.bands and len(args.bands) > 3:
         sys.exit('--bands: at most 3 band names allowed')
-    if not args.vel and not args.bands and len(args.files) > 3:
+    args.combine = args.diff or args.add
+    if args.combine:
+        if args.vel:
+            sys.exit('--diff/--add is not compatible with --vel')
+        n_src = len(args.bands) if args.bands else len(args.files)
+        if n_src != 2:
+            sys.exit('--diff/--add requires exactly 2 sources (2 files or --bands with 2 band names)')
+    if not args.vel and not args.bands and not args.combine and len(args.files) > 3:
         sys.exit('showimage: at most 3 files can be displayed simultaneously')
+
+    # Resolve filenames: fall back to .vrt, .tif, .geodat if bare name not found
+    resolved_files = []
+    geodat_flags = []
+    for f in args.files:
+        rpath, is_gd = resolveFilename(f)
+        if rpath != f:
+            print(f'showimage: {f!r} not found, using {rpath!r}')
+        resolved_files.append(rpath)
+        geodat_flags.append(is_gd)
+    args.files = resolved_files
 
     nisar_exts = {'.h5', '.he5', '.hdf5'}
     n_nisar = sum(1 for f in args.files if os.path.splitext(f)[1].lower() in nisar_exts)
@@ -1334,15 +1863,19 @@ def main():
     if is_nisar:
         if args.vel:
             sys.exit('showimage: --vel is not supported for NISAR HDF5 files')
+        if args.mask or args.invMask:
+            sys.exit('showimage: --mask/--invMask are not supported for NISAR HDF5 files')
 
         sw, sh = getScreenSize()
         nisar_infos = []
         for f in args.files:
-            nxi, nyi, product, loaders, h5 = openNisarH5(
+            nxi, nyi, product, loaders, h5, col_c, row_c = openNisarH5(
                 f, frequency=args.freq, pol=args.pol)
-            nisar_infos.append((f, nxi, nyi, product, loaders, h5))
+            nisar_infos.append((f, nxi, nyi, product, loaders, h5, col_c, row_c))
 
         n_display = len(args.bands) if args.bands else len(args.files)
+        if args.combine:
+            n_display += 1
         # factor for --bands (single file); multi-file uses per-file factor inside loop
         nxi0, nyi0 = nisar_infos[0][1], nisar_infos[0][2]
         if args.fullRes:
@@ -1358,7 +1891,7 @@ def main():
 
         if args.bands:
             # Display up to 3 named fields; no band-switcher buttons (same as GDAL --bands)
-            f, nxi, nyi, product, loaders, h5 = nisar_infos[0]
+            f, nxi, nyi, product, loaders, h5, col_c, row_c = nisar_infos[0]
             for bname in args.bands:
                 if bname not in loaders:
                     print(f'showimage: band "{bname}" not found — skipping',
@@ -1374,6 +1907,11 @@ def main():
                 vmax = args.vmax if args.vmax is not None else (
                     mod_val if mod_val is not None else np.nanpercentile(dec, 98))
                 print(f'{f} [{bname}]: {nxi}×{nyi} px, decimation ×{factor}')
+                ny_dec, nx_dec = base_dec.shape[:2]
+                _col_c = (np.linspace(col_c[0], col_c[-1], ny_dec)
+                          if col_c is not None and len(col_c) > 0 else None)
+                _row_c = (np.linspace(row_c[0], row_c[-1], nx_dec)
+                          if row_c is not None and len(row_c) > 0 else None)
                 image_defs.append({
                     'dec': dec,
                     'base': base_dec,
@@ -1384,15 +1922,20 @@ def main():
                     'cmap': args.cmap,
                     'vmin': vmin,
                     'vmax': vmax,
+                    'col_coords': _col_c,
+                    'row_coords': _row_c,
+                    'col_coord_label': 'Azimuth Time (s)',
+                    'row_coord_label': 'Slant Range (m)',
+                    'origin_lower': product.startswith('R'),
                     'is_rgb': False,
                 })
             if not image_defs:
-                for *_, h5 in nisar_infos:
+                for _f, _nxi, _nyi, _prod, _loaders, h5, _cc, _rc in nisar_infos:
                     h5.close()
                 sys.exit('showimage: no valid bands found')
             switch_infos = None
         else:
-            for f, nxi, nyi, product, loaders, h5 in nisar_infos:
+            for f, nxi, nyi, product, loaders, h5, col_c, row_c in nisar_infos:
                 if args.fullRes:
                     fi = 1
                 elif args.decFactor is not None:
@@ -1411,6 +1954,11 @@ def main():
                       f'decimation ×{fi}')
                 print(f'  Displaying: {first_band}')
                 print(f'  Available: {", ".join(loaders.keys())}')
+                ny_dec_i, nx_dec_i = dec.shape[:2]
+                _col_c = (np.linspace(col_c[0], col_c[-1], ny_dec_i)
+                          if col_c is not None and len(col_c) > 0 else None)
+                _row_c = (np.linspace(row_c[0], row_c[-1], nx_dec_i)
+                          if row_c is not None and len(row_c) > 0 else None)
                 image_defs.append({
                     'dec': dec,
                     'base': base_dec,
@@ -1421,6 +1969,11 @@ def main():
                     'cmap': args.cmap,
                     'vmin': vmin,
                     'vmax': vmax,
+                    'col_coords': _col_c,
+                    'row_coords': _row_c,
+                    'col_coord_label': 'Azimuth Time (s)',
+                    'row_coord_label': 'Slant Range (m)',
+                    'origin_lower': product.startswith('R'),
                     'is_rgb': False,
                 })
                 switch_infos.append({
@@ -1433,29 +1986,66 @@ def main():
                     'cache': None if args.noCache else {first_band: base_dec},
                 })
 
-        showImage(image_defs, sw, sh, switch_infos=switch_infos)
-        for *_, h5 in nisar_infos:
+        if args.combine:
+            _injectDiff(image_defs, args.add)
+            if switch_infos is not None:
+                switch_infos = list(switch_infos) + [None]
+        showImage(image_defs, sw, sh, switch_infos=switch_infos, rtl=args.right)
+        for _f, _nxi, _nyi, _prod, _loaders, h5, _cc, _rc in nisar_infos:
             h5.close()
         return
 
-    try:
-        from osgeo import gdal
-    except ImportError:
+    if gdal is None:
         sys.exit('osgeo.gdal not available — install gdal')
 
     gdal.UseExceptions()
 
     datasets = []
-    for f in args.files:
+    for f, is_geodat in zip(args.files, geodat_flags):
         try:
-            datasets.append(gdal.Open(f))
+            datasets.append(geodatToGdalMem(f) if is_geodat else gdal.Open(f))
         except Exception as e:
             sys.exit(f'Cannot open {f}: {e}')
+
+    mask_arr = None
+    mask_invert = False
+    if args.mask or args.invMask:
+        mask_file = args.mask or args.invMask
+        mask_invert = args.invMask is not None
+        mask_file, mask_is_geodat = resolveFilename(mask_file)
+        try:
+            mask_ds = geodatToGdalMem(mask_file) if mask_is_geodat else gdal.Open(mask_file)
+        except Exception as e:
+            sys.exit(f'Cannot open mask file {mask_file}: {e}')
+        mask_arr = mask_ds.GetRasterBand(1).ReadAsArray()
+        mask_ds = None
+
+    def applyMask(full_arr):
+        """Set masked pixels to NaN in a full-resolution array (before decimation)."""
+        if mask_arr is None:
+            return full_arr
+        if mask_arr.shape[:2] != full_arr.shape[:2]:
+            print(f'showimage: mask shape {mask_arr.shape[:2]} does not match '
+                  f'image shape {full_arr.shape[:2]} — skipping mask',
+                  file=sys.stderr)
+            return full_arr
+        out = full_arr.astype(np.float32, copy=True)
+        if mask_invert:
+            out[mask_arr != 0] = np.nan
+        else:
+            out[mask_arr == 0] = np.nan
+        return out
 
     sizes = [(ds.RasterXSize, ds.RasterYSize) for ds in datasets]
     nx, ny = sizes[0]  # used by --vel and --bands (single-file paths)
     sw, sh = getScreenSize()
     n_display = 1 if args.vel else (len(args.bands) if args.bands else len(args.files))
+    if args.combine:
+        n_display += 1
+    _inject_raw = (args.mod is not None and not args.vel and not args.bands
+                   and not args.combine and len(args.files) == 1)
+    if _inject_raw:
+        n_display += 1
 
     if args.fullRes:
         factor = 1
@@ -1470,15 +2060,20 @@ def main():
     if args.vel:
         ds = datasets[0]
         f  = args.files[0]
+        _gt_v = ds.GetGeoTransform()
+        _ol = _gt_v[5] > 0 or isNisarOriginLowerProduct(f)
         if ds.RasterCount < 2:
             sys.exit('--vel: file must have at least 2 bands (vx, vy)')
         if mod_val is None:
             mod_val = 100.0
-        vx = readBand(ds, 1)
-        vy = readBand(ds, 2)
+        vx = applyMask(readBand(ds, 1))
+        vy = applyMask(readBand(ds, 2))
         speed = np.where(np.isfinite(vx) & np.isfinite(vy),
                          np.sqrt(vx**2 + vy**2), np.nan)
         dec = blockAverage(speed, factor)
+        _ny_d, _nx_d = dec.shape[:2]
+        _col_c_v = _gt_v[3] + np.arange(_ny_d) * _gt_v[5] * factor
+        _row_c_v = _gt_v[0] + np.arange(_nx_d) * _gt_v[1] * factor
         if args.log:
             sv_min = args.vmin if args.vmin is not None else 1.0
             sv_max = args.vmax if args.vmax is not None else 3000.0
@@ -1497,6 +2092,11 @@ def main():
                 'cmap': args.cmap,
                 'vmin': None,
                 'vmax': None,
+                'col_coords': _col_c_v,
+                'row_coords': _row_c_v,
+                'col_coord_label': 'Y coordinate',
+                'row_coord_label': 'X coordinate',
+                'origin_lower': _ol,
                 'is_rgb': True,
             })
         else:
@@ -1516,18 +2116,25 @@ def main():
                 'cmap': args.cmap,
                 'vmin': vmin,
                 'vmax': vmax,
+                'col_coords': _col_c_v,
+                'row_coords': _row_c_v,
+                'col_coord_label': 'Y coordinate',
+                'row_coord_label': 'X coordinate',
+                'origin_lower': _ol,
                 'is_rgb': False,
             })
     elif args.bands:
         ds = datasets[0]
         f  = args.files[0]
+        _gt_b = ds.GetGeoTransform()
+        _ol = _gt_b[5] > 0 or isNisarOriginLowerProduct(f)
         for bname in args.bands:
             bnum = findBandByName(ds, bname)
             if bnum is None:
                 print(f'showimage: band "{bname}" not found in {f} — skipping',
                       file=sys.stderr)
                 continue
-            base_dec = blockAverage(readBand(ds, bnum), factor)
+            base_dec = blockAverage(applyMask(readBand(ds, bnum)), factor)
             dec = (np.where(np.isfinite(base_dec), base_dec % mod_val, base_dec)
                    if mod_val is not None else base_dec)
             vmin = args.vmin if args.vmin is not None else (
@@ -1535,6 +2142,9 @@ def main():
             vmax = args.vmax if args.vmax is not None else (
                 mod_val if mod_val is not None else np.nanpercentile(dec, 98))
             print(f'{f} [{bname}]: {nx}×{ny} px, decimation ×{factor}')
+            _ny_d, _nx_d = base_dec.shape[:2]
+            _col_c = _gt_b[3] + np.arange(_ny_d) * _gt_b[5] * factor
+            _row_c = _gt_b[0] + np.arange(_nx_d) * _gt_b[1] * factor
             image_defs.append({
                 'dec': dec,
                 'base': base_dec,
@@ -1545,6 +2155,11 @@ def main():
                 'cmap': args.cmap,
                 'vmin': vmin,
                 'vmax': vmax,
+                'col_coords': _col_c,
+                'row_coords': _row_c,
+                'col_coord_label': 'Y coordinate',
+                'row_coord_label': 'X coordinate',
+                'origin_lower': _ol,
                 'is_rgb': False,
             })
         if not image_defs:
@@ -1553,6 +2168,8 @@ def main():
         factors_per_file = []
         for ds, f in zip(datasets, args.files):
             nx_i, ny_i = ds.RasterXSize, ds.RasterYSize
+            _gt_i = ds.GetGeoTransform()
+            _ol = _gt_i[5] > 0 or isNisarOriginLowerProduct(f)
             if args.fullRes:
                 fi = 1
             elif args.decFactor is not None:
@@ -1570,13 +2187,16 @@ def main():
                 print(f'    showimage [options] {os.path.basename(f)} --bands {suggestion}')
                 print(f'  Available bands: {", ".join(bnames)}')
 
-            base_dec = blockAverage(readBand(ds, 1), fi)
+            base_dec = blockAverage(applyMask(readBand(ds, 1)), fi)
             dec = (np.where(np.isfinite(base_dec), base_dec % mod_val, base_dec)
                    if mod_val is not None else base_dec)
             vmin = args.vmin if args.vmin is not None else (
                 0.0 if mod_val is not None else np.nanpercentile(dec, 2))
             vmax = args.vmax if args.vmax is not None else (
                 mod_val if mod_val is not None else np.nanpercentile(dec, 98))
+            _ny_d, _nx_d = base_dec.shape[:2]
+            _col_c = _gt_i[3] + np.arange(_ny_d) * _gt_i[5] * fi
+            _row_c = _gt_i[0] + np.arange(_nx_d) * _gt_i[1] * fi
 
             image_defs.append({
                 'dec': dec,
@@ -1588,22 +2208,61 @@ def main():
                 'cmap': args.cmap,
                 'vmin': vmin,
                 'vmax': vmax,
+                'col_coords': _col_c,
+                'row_coords': _row_c,
+                'col_coord_label': 'Y coordinate',
+                'row_coord_label': 'X coordinate',
+                'origin_lower': _ol,
                 'is_rgb': False,
             })
+
+    if _inject_raw and image_defs:
+        idef0 = image_defs[0]
+        base0 = idef0['base']
+        image_defs.append({
+            'dec': base0,
+            'base': base0,
+            'mod_val': None,
+            'vmin_arg': args.vmin,
+            'vmax_arg': args.vmax,
+            'title': idef0['title'],
+            'cmap': args.cmap,
+            'vmin': (args.vmin if args.vmin is not None
+                     else float(np.nanpercentile(base0, 2))),
+            'vmax': (args.vmax if args.vmax is not None
+                     else float(np.nanpercentile(base0, 98))),
+            'col_coords': idef0.get('col_coords'),
+            'row_coords': idef0.get('row_coords'),
+            'col_coord_label': idef0.get('col_coord_label'),
+            'row_coord_label': idef0.get('row_coord_label'),
+            'origin_lower': idef0.get('origin_lower', False),
+            'is_rgb': False,
+        })
 
     switch_infos = None
     if not args.vel and not args.bands:
         per_pane = [
             {'ds': ds, 'factor': fi, 'mod_val': mod_val,
              'cmap': args.cmap, 'vmin_arg': args.vmin, 'vmax_arg': args.vmax,
-             'cache': None if args.noCache else {}}
+             'cache': None if args.noCache else {},
+             'mask_arr': mask_arr, 'mask_invert': mask_invert}
             if ds.RasterCount > 1 else None
             for ds, fi in zip(datasets, factors_per_file)
         ]
         if any(si is not None for si in per_pane):
             switch_infos = per_pane
 
-    showImage(image_defs, sw, sh, switch_infos=switch_infos)
+    if _inject_raw and switch_infos is not None:
+        raw_si = {**switch_infos[0], 'mod_val': None,
+                  'cache': None if args.noCache else {}}
+        switch_infos = [switch_infos[0], raw_si]
+
+    if args.combine:
+        _injectDiff(image_defs, args.add)
+        if switch_infos is not None:
+            switch_infos = list(switch_infos) + [None]
+
+    showImage(image_defs, sw, sh, switch_infos=switch_infos, rtl=args.right)
 
 
 def showvel():
