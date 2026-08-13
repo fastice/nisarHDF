@@ -124,7 +124,7 @@ class nisarBaseHDF():
             self.commonParams += ['secondaryOrbit', 'secondaryDatetime',
                                   'secondaryGranule']
         self.commonParams += ['LookDirection', 'PassType',
-                              'Wavelength', 'PRF', 'epsg']
+                              'Wavelength', 'PRF', 'epsg', 'CRID']
         #
         self.noDataValuesTiff = {'connectedComponents': 65535,
                                  'coherenceMagnitude': np.nan,
@@ -655,6 +655,8 @@ class nisarBaseHDF():
         self.getPolarizations()
         # Set image name
         self.ImageName = os.path.basename(hdfFile)
+        # Composite Release ID (processor version, e.g. 'P05023')
+        self.getCRID()
         # Parse primary parameters.
         self.parseParams(referenceOrbit=referenceOrbit,
                          secondaryOrbit=secondaryOrbit,
@@ -683,6 +685,28 @@ class nisarBaseHDF():
             self.parseString(procInfo['inputs']['l1ReferenceSlcGranules'])
         self.secondaryGranule = \
             self.parseString(procInfo['inputs']['l1SecondarySlcGranules'])
+
+    def getCRID(self):
+        '''
+        Get this product's Composite Release ID (processor version, e.g.
+        'P05023') from the HDF identification group, falling back to the
+        letter+5-digit CRID token in the granule filename if the HDF lacks it.
+
+        Returns
+        -------
+        None.
+
+        '''
+        try:
+            self.CRID = self.parseString(
+                self.h5['identification']['compositeReleaseId'])
+        except KeyError:
+            self.CRID = None
+            for tok in os.path.basename(
+                    getattr(self, 'hdfFile', '') or '').split('_'):
+                if len(tok) == 6 and tok[0].isalpha() and tok[1:].isdigit():
+                    self.CRID = tok
+                    break
 
     def getLookDirection(self):
         '''

@@ -10,6 +10,11 @@ try:
 except ImportError:
     gdal = None
 
+try:
+    from osgeo import ogr
+except ImportError:
+    ogr = None
+
 DPI = 100
 CBAR_PX = 120   # pixels reserved for colorbar panel
 SCROLLBAR_W = 18  # scrollbar widget thickness
@@ -95,6 +100,49 @@ def findBandByName(ds, name):
         if band.GetMetadata().get('Description') == name:
             return b
     return None
+
+
+def readMaskBand(ds, bandNum):
+    """Return a full-resolution boolean 'valid' mask array (True = valid) for a
+    GDAL band, or None if it has no real *explicit* mask band.
+
+    Only GMF_PER_DATASET (an actual stored mask band, shared or per-band -- the
+    "embedded VRT dataset mask band" the GIT64 C binaries' '-noMask' flag refers
+    to, honored by default there too) counts. GMF_ALL_VALID (no masking at all)
+    and a bare GMF_NODATA (the band merely has a NoData value -- readBand() already
+    turns that into NaN on its own) are both deliberately excluded, since neither
+    represents a separate, toggleable masking layer.
+    """
+    band = ds.GetRasterBand(bandNum)
+    if not (band.GetMaskFlags() & gdal.GMF_PER_DATASET):
+        return None
+    return band.GetMaskBand().ReadAsArray() > 0
+
+
+def decimateMask(mask_full, factor):
+    """Block-average a full-resolution boolean mask to the same decimation grid
+    blockAverage() uses for image data. A block is 'valid' if a majority of its
+    pixels are valid (matches blockAverage()'s own nanmean-based decimation, rather
+    than an all-or-nothing rule that could make a mostly-invalid block look solid)."""
+    ny, nx = mask_full.shape[:2]
+    ny2 = (ny // factor) * factor
+    nx2 = (nx // factor) * factor
+    frac = mask_full[:ny2, :nx2].astype(np.float32)
+    frac = frac.reshape(ny2 // factor, factor, nx2 // factor, factor).mean(axis=(1, 3))
+    return frac > 0.5
+
+
+def combineMasks(vrt_mask, file_mask):
+    """AND a file's own embedded VRT mask band (vrt_mask) with an external --mask
+    file's mask (file_mask) into one effective boolean 'valid' array -- both are
+    decimated boolean arrays from decimateMask(), or None if not present. Returns
+    None only if neither is present. Inversion (the InvMask button) is applied
+    afterward, at display time, to this combined result -- see showImage()'s
+    _redrawMaskedPane() -- so it flips whichever mask(s) are in play, regardless
+    of source, rather than being baked in here."""
+    if vrt_mask is not None and file_mask is not None:
+        return vrt_mask & file_mask
+    return vrt_mask if vrt_mask is not None else file_mask
 
 
 def isNisarOriginLowerProduct(filename):
@@ -321,6 +369,321 @@ def hsvSpeedRender(speed, vmin=1.0, vmax=3000.0):
     hue = np.nan_to_num(hue, nan=0.0)
     hsv = np.moveaxis(np.array([hue, saturation, value]), 0, 2)
     return mcolors.hsv_to_rgb(hsv).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# GeoPackage (or any OGR vector source) point/polygon overlay
+# ---------------------------------------------------------------------------
+
+def _iterSubGeoms(g):
+    """Yield individual (non-multi) OGR geometries within g, recursing through
+    MULTI*/GEOMETRYCOLLECTION containers."""
+    gtype = g.GetGeometryName()
+    if gtype.startswith('MULTI') or gtype == 'GEOMETRYCOLLECTION':
+        for i in range(g.GetGeometryCount()):
+            yield from _iterSubGeoms(g.GetGeometryRef(i))
+    else:
+        yield g
+
+
+def _geomToCoords(g):
+    """Convert a single (non-multi) OGR geometry to plain-Python world coordinates.
+
+    Returns (kind, coords):
+        'Point'      -> [(x, y)]
+        'LineString' -> [(x, y), ...]
+        'Polygon'    -> [ring, ...] where each ring is [(x, y), ...] (first ring is
+                        the exterior; any further rings are holes, drawn the same way)
+    Returns (None, None) for unsupported geometry types.
+    """
+    gtype = g.GetGeometryName()
+    if gtype == 'POINT':
+        return 'Point', [(g.GetX(), g.GetY())]
+    if gtype == 'LINESTRING':
+        return 'LineString', [g.GetPoint(j)[:2] for j in range(g.GetPointCount())]
+    if gtype == 'POLYGON':
+        rings = []
+        for i in range(g.GetGeometryCount()):
+            ring = g.GetGeometryRef(i)
+            rings.append([ring.GetPoint(j)[:2] for j in range(ring.GetPointCount())])
+        return 'Polygon', rings
+    return None, None
+
+
+def readGpkgOverlay(path, layer_name=None):
+    """Read Point/LineString/Polygon geometries and every attribute field from a
+    GeoPackage (or any OGR vector source, e.g. shapefile).
+
+    Reads all fields (rather than a single one) so the caller can offer a
+    dropdown to switch which field colors the overlay without re-reading the file.
+
+    Assumes the vector layer is already in the same projected CRS as the raster(s)
+    being displayed -- no reprojection is attempted (world coordinates are used
+    as-is against each raster's own geotransform).
+
+    Returns a dict:
+        geom_type   : 'Point' | 'LineString' | 'Polygon'
+        geoms       : list, one entry per feature (or per sub-geometry of a MULTI*
+                      feature), each in the format _geomToCoords() returns for that type
+        fields      : {field_name: {'values': [...], 'is_numeric': bool}} -- each
+                      values list is parallel to geoms (one raw OGR value per entry)
+        field_names : field names in layer-definition order (for a selection dropdown)
+        source      : the file path (echoed back)
+    """
+    if ogr is None:
+        sys.exit('showimage: osgeo.ogr not available -- install gdal (with ogr support) '
+                 'to use --gpkg')
+    ds = ogr.Open(path)
+    if ds is None:
+        sys.exit(f'showimage: cannot open {path!r} as an OGR vector source')
+    layer = ds.GetLayerByName(layer_name) if layer_name else ds.GetLayer(0)
+    if layer is None:
+        avail = [ds.GetLayer(i).GetName() for i in range(ds.GetLayerCount())]
+        sys.exit(f'showimage: layer {layer_name!r} not found in {path!r} '
+                 f'(available: {", ".join(avail)})')
+    ldefn = layer.GetLayerDefn()
+    field_names = [ldefn.GetFieldDefn(i).GetName() for i in range(ldefn.GetFieldCount())]
+    if not field_names:
+        sys.exit(f'showimage: {path!r} has no attribute fields to color by')
+    numeric_types = (ogr.OFTInteger, ogr.OFTInteger64, ogr.OFTReal)
+    is_numeric_by_field = {
+        ldefn.GetFieldDefn(i).GetName(): ldefn.GetFieldDefn(i).GetType() in numeric_types
+        for i in range(ldefn.GetFieldCount())
+    }
+
+    geom_type = None
+    geoms = []
+    field_values = {name: [] for name in field_names}
+    for feat in layer:
+        g = feat.GetGeometryRef()
+        if g is None:
+            continue
+        row = {name: feat.GetField(name) for name in field_names}
+        for sub in _iterSubGeoms(g):
+            gt, coords = _geomToCoords(sub)
+            if gt is None:
+                continue
+            geom_type = geom_type or gt
+            geoms.append(coords)
+            for name in field_names:
+                field_values[name].append(row[name])
+
+    if not geoms:
+        sys.exit(f'showimage: no Point/LineString/Polygon geometries found in {path!r} '
+                 '(other geometry types are not supported)')
+
+    fields = {name: {'values': field_values[name], 'is_numeric': is_numeric_by_field[name]}
+              for name in field_names}
+    return {'geom_type': geom_type, 'geoms': geoms, 'fields': fields,
+            'field_names': field_names, 'source': path}
+
+
+def buildGpkgColors(values, is_numeric, cmap_name='viridis', vmin=None, vmax=None):
+    """Map one attribute value per feature to a per-feature hex color, plus a
+    legend descriptor.
+
+    Numeric attributes get a continuous colormap; legend = {'kind': 'numeric',
+    'cmap': cmap_name, 'vmin': ..., 'vmax': ...}. vmin/vmax default to the data's
+    own min/max (2nd/98th-percentile-free -- the *actual* extremes, since residual/
+    QC fields are usually small enough that outliers themselves are the point) but
+    can be overridden by the caller (e.g. a user-entered min/max in the Legend
+    window) -- values outside [vmin, vmax] are clamped to the colormap's end colors,
+    matplotlib's normal behavior.
+    Non-numeric (categorical) attributes get a fixed 10-color qualitative palette,
+    cycled if there are more than 10 distinct values; legend = {'kind':
+    'categorical', 'entries': [(label, hexcolor), ...]} in first-seen order.
+    Missing/unparseable values are rendered mid-gray (#808080) in both cases.
+    """
+    import matplotlib.cm as mcm
+    import matplotlib.colors as mcolors
+
+    GRAY = '#808080'
+
+    if is_numeric:
+        arr = np.array([np.nan if v is None else float(v) for v in values], dtype=float)
+        finite = arr[np.isfinite(arr)]
+        if vmin is None:
+            vmin = float(np.nanmin(finite)) if finite.size else 0.0
+        if vmax is None:
+            vmax = float(np.nanmax(finite)) if finite.size else 1.0
+        if vmin == vmax:
+            vmax = vmin + 1.0
+        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+        cmap = mcm.get_cmap(cmap_name)
+        colors = []
+        for v in arr:
+            if not np.isfinite(v):
+                colors.append(GRAY)
+            else:
+                r, gg, b, _ = cmap(norm(v))
+                colors.append('#%02x%02x%02x' % (int(r * 255), int(gg * 255), int(b * 255)))
+        legend = {'kind': 'numeric', 'cmap': cmap_name, 'vmin': vmin, 'vmax': vmax}
+        return colors, legend
+
+    # categorical: first-seen order, fixed qualitative palette (same 10 hex values as
+    # nisargrimpworkflow.buildFrameLayers.rBaselineClassColors, ColorBrewer RdYlGn --
+    # copied rather than imported, for visual consistency with QC GeoPackage styling
+    # elsewhere in the pipeline without adding a cross-package dependency)
+    palette = ['#006837', '#1a9850', '#66bd63', '#a6d96a', '#d9ef8b',
+              '#fee08b', '#fdae61', '#f46d43', '#d73027', '#a50026']
+    cats = []
+    seen = set()
+    for v in values:
+        key = '' if v is None else str(v)
+        if key not in seen:
+            seen.add(key)
+            cats.append(key)
+    cat_color = {c: palette[i % len(palette)] for i, c in enumerate(cats)}
+    colors = [GRAY if v is None else cat_color[str(v)] for v in values]
+    legend = {'kind': 'categorical',
+             'entries': [(c if c else '(none)', cat_color[c]) for c in cats]}
+    return colors, legend
+
+
+def worldToPixel(x, y, gt, factor=1):
+    """Convert world (x, y) to (row, col) in the DECIMATED display array using
+    geotransform gt = (x0, dx, 0, y0, 0, dy) and decimation factor."""
+    col_full = (x - gt[0]) / gt[1]
+    row_full = (y - gt[3]) / gt[5]
+    return row_full / factor, col_full / factor
+
+
+def worldToCanvas(x, y, gt, factor, ny_dec, origin_lower):
+    """Convert world (x, y) to Tkinter canvas (x_px, y_px), accounting for the
+    vertical flip _disp() applies when origin_lower is True."""
+    row, col = worldToPixel(x, y, gt, factor)
+    if origin_lower:
+        row = (ny_dec - 1) - row
+    return col, row
+
+
+def openGpkgLegend(overlay, parent=None, on_change=None, anchor=None, rtl=False):
+    """Open a small Toplevel showing the color legend for a GeoPackage overlay's
+    attribute -- a colorbar (with min/max override) for a numeric attribute, or a
+    swatch list for a categorical one.
+
+    If overlay['field_names'] has more than one entry, a 'Color by:' dropdown is
+    shown above the legend body; picking a different field calls
+    on_change(field_name) (autoscaled -- see showImage()'s recolor_gpkg()), expected
+    to update overlay['legend']/['attribute'] and redraw the canvas overlay in
+    place, and then rebuilds this window's legend body to match. For a numeric
+    attribute, Min/Max entries (pre-filled with the autoscaled defaults) plus
+    Apply/Auto buttons let the user override the colormap range the same way;
+    Apply calls on_change(attribute, vmin=..., vmax=...), Auto calls
+    on_change(attribute) to restore autoscaling.
+
+    anchor, if given, is (img_x, img_y, img_w) -- the main image window's screen
+    position/width -- used to place this window just outside it, on the side
+    opposite the Controls palette (right when rtl is False, since Controls sits
+    on the left there; left when rtl is True). Repositioned after every rebuild
+    since the numeric/categorical bodies differ in size.
+    """
+    import tkinter as tk
+    from tkinter import ttk
+
+    win = tk.Toplevel(parent)
+
+    field_names = overlay.get('field_names') or [overlay['attribute']]
+    field_var = tk.StringVar(value=overlay['attribute'])
+    if len(field_names) > 1:
+        sel_row = ttk.Frame(win)
+        sel_row.pack(fill='x', padx=8, pady=(8, 2))
+        ttk.Label(sel_row, text='Color by:').pack(side='left')
+        combo = ttk.Combobox(sel_row, textvariable=field_var, values=field_names,
+                             state='readonly', width=18)
+        combo.pack(side='left', padx=(4, 0), fill='x', expand=True)
+
+    body = ttk.Frame(win)
+    body.pack(fill='both', expand=True)
+
+    def _reposition():
+        win.geometry('')
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        if anchor is not None:
+            img_x, img_y, img_w = anchor
+            x = max(0, img_x - 5 - w) if rtl else img_x + img_w + 5
+            win.geometry(f'{w}x{h}+{x}+{img_y}')
+        else:
+            win.geometry(f'{w}x{h}')
+
+    def _build_body():
+        for child in body.winfo_children():
+            child.destroy()
+        legend = overlay['legend']
+        win.title(f"Legend: {overlay['attribute']}")
+
+        if legend['kind'] == 'numeric':
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+            # Reuse the same colorbar-figure builder as the per-pane data colorbars
+            # (makeColorbarFig), just with this attribute's own cmap/range and a title.
+            fig = makeColorbarFig(legend['cmap'], legend['vmin'], legend['vmax'], 330)
+            fig.text(0.5, 0.97, overlay['attribute'], ha='center', va='top', fontsize=9)
+            canvas = FigureCanvasTkAgg(fig, master=body)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill='both', expand=True)
+
+            range_row = ttk.Frame(body)
+            range_row.pack(fill='x', padx=8, pady=(2, 8))
+            vmin_var = tk.StringVar(value=f"{legend['vmin']:.4g}")
+            vmax_var = tk.StringVar(value=f"{legend['vmax']:.4g}")
+
+            def _apply_range():
+                try:
+                    lo, hi = float(vmin_var.get()), float(vmax_var.get())
+                except ValueError:
+                    return
+                if on_change is not None:
+                    on_change(overlay['attribute'], vmin=lo, vmax=hi)
+                _build_body()
+
+            def _auto_range():
+                if on_change is not None:
+                    on_change(overlay['attribute'])
+                _build_body()
+
+            ttk.Label(range_row, text='Min:').pack(side='left')
+            min_ent = ttk.Entry(range_row, textvariable=vmin_var, width=8)
+            min_ent.pack(side='left', padx=(2, 6))
+            ttk.Label(range_row, text='Max:').pack(side='left')
+            max_ent = ttk.Entry(range_row, textvariable=vmax_var, width=8)
+            max_ent.pack(side='left', padx=(2, 6))
+            min_ent.bind('<Return>', lambda e: _apply_range())
+            max_ent.bind('<Return>', lambda e: _apply_range())
+            ttk.Button(range_row, text='Apply', command=_apply_range).pack(side='left', padx=2)
+            ttk.Button(range_row, text='Auto', command=_auto_range).pack(side='left', padx=2)
+        else:
+            ttk.Label(body, text=overlay['attribute'], font=('', 10, 'bold')).pack(
+                padx=10, pady=(8, 4), anchor='w')
+            for label, color in legend['entries']:
+                row = ttk.Frame(body)
+                row.pack(fill='x', padx=10, pady=1, anchor='w')
+                swatch = tk.Canvas(row, width=14, height=14, highlightthickness=1,
+                                   highlightbackground='black', bg=color)
+                swatch.pack(side='left', padx=(0, 6))
+                ttk.Label(row, text=label).pack(side='left')
+            ttk.Frame(body, height=6).pack()
+
+        # Auto-size (and reposition, if anchored) to fit whichever body was just
+        # built -- colorbar and swatch-list bodies differ in size, and the dropdown
+        # row is optional -- same geometry('') + reqheight idiom showImage() uses
+        # for the palette.
+        _reposition()
+
+    def _on_select(event=None):
+        field_name = field_var.get()
+        if field_name == overlay['attribute']:
+            return
+        if on_change is not None:
+            on_change(field_name)
+        _build_body()
+
+    if len(field_names) > 1:
+        combo.bind('<<ComboboxSelected>>', _on_select)
+
+    _build_body()
+    return win
 
 
 def extractProfile(dec, r0, c0, r1, c1):
@@ -557,7 +920,7 @@ def bindScroll(tk_canvas):
 # Main display
 # -----------------------------------------------------------------------
 
-def showImage(image_defs, sw, sh, switch_infos=None, rtl=False):
+def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=None):
     """Display 1–3 images side by side with a floating control palette.
 
     image_defs: list of dicts, each with keys:
@@ -567,6 +930,9 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False):
         with the image and plot/profile windows opening to its left
         (mirror of the default left-to-right layout) — lets a second
         instance be run without overlapping the first.
+    gpkg_overlay: optional dict from main() (geom_type, geoms, colors, legend,
+        attribute, point_radius, fill_polygons) -- drawn on every pane that has its
+        own 'geotransform'/'dec_factor' (see readGpkgOverlay()/buildGpkgColors()).
     """
     import tkinter as tk
     from tkinter import ttk
@@ -597,6 +963,7 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False):
     lines_visible       = [True]
     coords_active       = [any(d.get('col_coords') is not None for d in image_defs)]
     overlay_set_visible = [None]
+    gpkg_overlay_items = []  # (canvas, item) pairs; populated once panes exist, below
     all_same_size = all(d['dec'].shape == image_defs[0]['dec'].shape for d in image_defs)
     scroll_synced = [all_same_size]  # default: synced iff all same size
     profile_pts         = []
@@ -619,6 +986,30 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False):
     coords_btn  = ttk.Button(btn_col, text='Coords ✓' if coords_active[0] else 'Coords')
     quit_btn    = ttk.Button(btn_col, text='Quit', command=root.destroy)
     core_btns = [pick_btn, profile_btn, col_btn, row_btn, lines_btn, coords_btn]
+    gpkg_visible = [True]
+    if gpkg_overlay is not None:
+        gpkg_btn = ttk.Button(btn_col, text='GPKG ✓')
+        core_btns.append(gpkg_btn)
+    else:
+        gpkg_btn = None
+    # Masks (a file's own embedded VRT mask band and/or an external --mask file,
+    # combined via combineMasks()) are honored by default; button only shown if at
+    # least one currently-loaded pane/band actually has one.
+    mask_applied_state = [True]
+    if any(d.get('embedded_mask') is not None for d in image_defs):
+        mask_btn = ttk.Button(btn_col, text='Mask ✓')
+        core_btns.append(mask_btn)
+    else:
+        mask_btn = None
+    # InvMask flips the effective combined mask's sense, whatever its source(s) --
+    # embedded VRT mask band and/or --mask. Same visibility condition as Mask,
+    # since anywhere there's a mask to toggle on/off, there's one worth inverting.
+    mask_inverted_state = [False]
+    if any(d.get('embedded_mask') is not None for d in image_defs):
+        invmask_btn = ttk.Button(btn_col, text='InvMask ✗')
+        core_btns.append(invmask_btn)
+    else:
+        invmask_btn = None
     if n_imgs > 1:
         sync_btn = ttk.Button(btn_col,
                               text='Sync ✓' if scroll_synced[0] else 'Sync')
@@ -671,6 +1062,34 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False):
     status_var = tk.StringVar(value='Ready')
     status_lbl = ttk.Label(palette, textvariable=status_var, anchor='nw', wraplength=130)
     status_lbl.pack(side='bottom', fill='both', expand=True, padx=6, pady=(0, 4))
+
+    def _grow_palette_for_status():
+        """Grow (never shrink) the palette window when the status text needs
+        more vertical space than it currently has. The palette's height is
+        otherwise fixed once at startup (based on the initial short 'Ready'
+        text), so a longer multi-line readout (e.g. a multi-image point
+        sample) would otherwise be silently clipped -- resizable(False,
+        False) only blocks manual drag-resize, not this.
+        An explicit geometry() (already applied once at startup below, and
+        again here) turns off Tk's automatic size propagation for this
+        toplevel, so winfo_reqheight() would otherwise keep reporting the
+        stale, startup-time size -- clear it momentarily to force a fresh
+        measurement, then reapply."""
+        cur_w = palette.winfo_width()
+        cur_h = palette.winfo_height()
+        palette.geometry('')
+        palette.update_idletasks()
+        needed_h = palette.winfo_reqheight()
+        new_h = min(max(needed_h, cur_h), win_h_max)
+        palette.geometry(f'{cur_w}x{new_h}')
+
+    def _on_status_write(*_args):
+        # Deferred via after_idle: the StringVar trace fires synchronously,
+        # before ttk.Label's own internal trace has updated the displayed
+        # text, so measuring immediately here would see the previous value.
+        palette.after_idle(_grow_palette_for_status)
+
+    status_var.trace_add('write', _on_status_write)
 
     def deactivate_all():
         pick_active[0] = False
@@ -729,6 +1148,15 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False):
         if overlay_set_visible[0]:
             overlay_set_visible[0](lines_visible[0])
     lines_btn.config(command=toggle_lines)
+
+    if gpkg_btn is not None:
+        def toggle_gpkg():
+            gpkg_visible[0] = not gpkg_visible[0]
+            gpkg_btn.config(text='GPKG ✓' if gpkg_visible[0] else 'GPKG ✗')
+            vis = 'normal' if gpkg_visible[0] else 'hidden'
+            for canvas, item in gpkg_overlay_items:
+                canvas.itemconfigure(item, state=vis)
+        gpkg_btn.config(command=toggle_gpkg)
 
     def toggle_coords_palette():
         coords_active[0] = not coords_active[0]
@@ -1324,6 +1752,164 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False):
         c.bind('<Shift-Button-4>',   _sb4)
         c.bind('<Shift-Button-5>',   _sb5)
 
+    # ---- GeoPackage overlay (drawn once at startup; toggled via the GPKG button) ----
+    def draw_gpkg_overlay():
+        if gpkg_overlay is None:
+            return
+        gtype = gpkg_overlay['geom_type']
+        geoms = gpkg_overlay['geoms']
+        colors = gpkg_overlay['colors']
+        radius = gpkg_overlay.get('point_radius', 4)
+        fill_polys = gpkg_overlay.get('fill_polygons', False)
+        for idef, ref in zip(image_defs, pane_refs):
+            gt = idef.get('geotransform')
+            if gt is None:
+                continue
+            factor = idef.get('dec_factor', 1)
+            ol = idef.get('origin_lower', False)
+            ny_dec = ref['ny']
+            canvas = ref['canvas']
+            for geom, color in zip(geoms, colors):
+                if gtype == 'Point':
+                    x, y = geom[0]
+                    col, row = worldToCanvas(x, y, gt, factor, ny_dec, ol)
+                    item = canvas.create_oval(col - radius, row - radius,
+                                              col + radius, row + radius,
+                                              fill=color, outline='black', width=1)
+                    gpkg_overlay_items.append((canvas, item))
+                elif gtype == 'LineString':
+                    pts = []
+                    for x, y in geom:
+                        col, row = worldToCanvas(x, y, gt, factor, ny_dec, ol)
+                        pts.extend([col, row])
+                    if len(pts) >= 4:
+                        item = canvas.create_line(*pts, fill=color, width=2)
+                        gpkg_overlay_items.append((canvas, item))
+                elif gtype == 'Polygon':
+                    for ring in geom:
+                        pts = []
+                        for x, y in ring:
+                            col, row = worldToCanvas(x, y, gt, factor, ny_dec, ol)
+                            pts.extend([col, row])
+                        if len(pts) >= 6:
+                            if fill_polys:
+                                item = canvas.create_polygon(
+                                    *pts, outline=color, fill=color,
+                                    stipple='gray50', width=2)
+                            else:
+                                item = canvas.create_polygon(
+                                    *pts, outline=color, fill='', width=2)
+                            gpkg_overlay_items.append((canvas, item))
+
+    def clear_gpkg_overlay():
+        for canvas, item in gpkg_overlay_items:
+            canvas.delete(item)
+        gpkg_overlay_items.clear()
+
+    def recolor_gpkg(field_name, vmin=None, vmax=None):
+        """Recompute colors for a selected attribute field and redraw -- called
+        from the Legend window's field dropdown (vmin/vmax omitted, i.e. autoscale)
+        and its Apply/Auto min-max controls (vmin/vmax given to override, or
+        omitted for Auto)."""
+        fvals = gpkg_overlay['fields'][field_name]
+        colors, legend = buildGpkgColors(fvals['values'], fvals['is_numeric'],
+                                         cmap_name=gpkg_overlay.get('cmap', 'viridis'),
+                                         vmin=vmin, vmax=vmax)
+        gpkg_overlay['colors'] = colors
+        gpkg_overlay['legend'] = legend
+        gpkg_overlay['attribute'] = field_name
+        clear_gpkg_overlay()
+        draw_gpkg_overlay()
+        if not gpkg_visible[0]:
+            for canvas, item in gpkg_overlay_items:
+                canvas.itemconfigure(item, state='hidden')
+
+    draw_gpkg_overlay()
+
+    # ---- embedded mask band toggle (single toggle shared across all panes;
+    #      per-pane, since only panes with their own embedded_mask are affected) ----
+    def _redrawMaskedPane(idef, ref, apply_it, inverted):
+        """(Re)compute idef['dec']/['base'] from idef['raw_unmasked'] and
+        idef['embedded_mask'] given whether the mask should currently be applied
+        and whether it's currently inverted, and redraw that pane's canvas. Shared
+        by the Mask and InvMask handlers -- inversion is applied here, at display
+        time, to whichever mask(s) are in play (embedded VRT mask and/or --mask,
+        already AND-ed together in idef['embedded_mask']), rather than baked into
+        that stored value, so InvMask affects any mask source uniformly."""
+        m = idef.get('embedded_mask')
+        if m is not None and inverted:
+            m = ~m
+        raw = idef['raw_unmasked']
+        masked = np.where(m, raw, np.nan) if (apply_it and m is not None) else raw
+        idef['mask_applied'] = apply_it and m is not None
+        hsv = idef.get('hsv_render')
+        if hsv is not None:
+            sv_min, sv_max = hsv
+            new_dec = hsvSpeedRender(masked, sv_min, sv_max)
+            idef['raw'] = masked
+            idef['base'] = masked
+            idef['dec'] = new_dec
+            new_photo = decToPhoto(_disp(new_dec, idef.get('origin_lower', False)),
+                                   idef['cmap'], idef['vmin'], idef['vmax'], True)
+        else:
+            mod_v = idef.get('mod_val')
+            new_dec = (np.where(np.isfinite(masked), masked % mod_v, masked)
+                      if mod_v is not None else masked)
+            idef['base'] = masked
+            idef['dec'] = new_dec
+            new_photo = decToPhoto(_disp(new_dec, idef.get('origin_lower', False)),
+                                   idef['cmap'], idef['vmin'], idef['vmax'], False)
+        ref['canvas'].itemconfigure(ref['img_item'], image=new_photo)
+        ref['canvas'].image = new_photo
+
+    def _refreshDiffPane():
+        """Recompute the diff/sum pane (if any) from the current base arrays of panes 1 and 2."""
+        if len(image_defs) < 3 or not image_defs[-1].get('is_diff'):
+            return
+        d_idef = image_defs[-1]
+        d_ref = pane_refs[-1]
+        d_add = d_idef['add_mode']
+        d_op = '+' if d_add else '−'
+        d_arr, d_sc, d_stats = _computeDiffArray(
+            image_defs[0]['base'], image_defs[1]['base'], d_add)
+        d_title = f'P1 {d_op} P2    {d_stats}'
+        d_idef.update({'dec': d_arr, 'base': d_arr,
+                       'vmin': -d_sc, 'vmax': d_sc, 'title': d_title})
+        d_photo = decToPhoto(_disp(d_arr, d_idef.get('origin_lower', False)),
+                             'RdBu', -d_sc, d_sc, False)
+        d_ref['canvas'].itemconfigure(d_ref['img_item'], image=d_photo)
+        d_ref['canvas'].image = d_photo
+        _rebuildColorbar(d_ref, 'RdBu', -d_sc, d_sc)
+        d_ref['title_lbl'].config(text=f'{len(image_defs)}) {d_title}')
+
+    def toggle_embedded_mask():
+        mask_applied_state[0] = not mask_applied_state[0]
+        apply_it = mask_applied_state[0]
+        mask_btn.config(text='Mask ✓' if apply_it else 'Mask ✗')
+        for idef, ref in zip(image_defs, pane_refs):
+            if idef.get('embedded_mask') is None:
+                continue
+            _redrawMaskedPane(idef, ref, apply_it, mask_inverted_state[0])
+        _refreshDiffPane()
+        status_var.set(f"Mask {'applied' if apply_it else 'ignored'}")
+
+    if mask_btn is not None:
+        mask_btn.config(command=toggle_embedded_mask)
+
+    def toggle_mask_invert():
+        mask_inverted_state[0] = not mask_inverted_state[0]
+        inverted = mask_inverted_state[0]
+        invmask_btn.config(text='InvMask ✓' if inverted else 'InvMask ✗')
+        for idef, ref in zip(image_defs, pane_refs):
+            if idef.get('embedded_mask') is None:
+                continue
+            _redrawMaskedPane(idef, ref, mask_applied_state[0], inverted)
+        _refreshDiffPane()
+        status_var.set(f"Mask sense {'inverted' if inverted else 'normal'}")
+
+    if invmask_btn is not None:
+        invmask_btn.config(command=toggle_mask_invert)
+
     # ---- overlay helpers (items stored as (canvas, item_id) pairs) ----
     profile_overlay_items = []
     col_overlay_items     = []   # vertical lines from Col Plot clicks
@@ -1549,28 +2135,38 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False):
             def switch():
                 cache = p_si['cache']
                 if cache is not None and bname in cache:
-                    base_dec = cache[bname]
+                    raw_unmasked = cache[bname]
                 else:
                     if 'ds' in p_si:
-                        band_arr = readBand(p_si['ds'], bnum)
-                        m_arr = p_si.get('mask_arr')
-                        if m_arr is not None:
-                            if m_arr.shape[:2] == band_arr.shape[:2]:
-                                band_arr = band_arr.astype(np.float32, copy=True)
-                                if p_si.get('mask_invert'):
-                                    band_arr[m_arr != 0] = np.nan
-                                else:
-                                    band_arr[m_arr == 0] = np.nan
-                            else:
-                                print(f'showimage: mask shape {m_arr.shape[:2]} does not '
-                                      f'match image shape {band_arr.shape[:2]} — skipping mask',
-                                      file=sys.stderr)
-                        base_dec = blockAverage(band_arr, p_si['factor'])
+                        raw_unmasked = blockAverage(readBand(p_si['ds'], bnum), p_si['factor'])
                     else:
-                        base_dec = blockAverage(
+                        raw_unmasked = blockAverage(
                             p_si['loaders'][bname](), p_si['factor'])
                     if cache is not None:
-                        cache[bname] = base_dec
+                        cache[bname] = raw_unmasked
+                # Embedded VRT mask band -- re-detected per band, since a per-band
+                # mask can differ from band to band even though most files share one
+                # per-dataset mask for all bands. p_si['file_mask'] (an external
+                # --mask, if given) is the same for every band of this pane, already
+                # decimated once in main().
+                vrt_mask = None
+                if 'ds' in p_si:
+                    vrt_mask_full = readMaskBand(p_si['ds'], bnum)
+                    if vrt_mask_full is not None:
+                        vrt_mask = decimateMask(vrt_mask_full, p_si['factor'])
+                embedded_mask = combineMasks(vrt_mask, p_si.get('file_mask'))
+                # InvMask flips whichever mask(s) are in play at display time (see
+                # _redrawMaskedPane()) rather than being baked into embedded_mask.
+                effective_mask = embedded_mask
+                if effective_mask is not None and mask_inverted_state[0]:
+                    effective_mask = ~effective_mask
+                apply_mask = effective_mask is not None and mask_applied_state[0]
+                base_dec = np.where(effective_mask, raw_unmasked, np.nan) if apply_mask else raw_unmasked
+                p_idef['raw_unmasked'] = raw_unmasked
+                p_idef['vrt_mask'] = vrt_mask
+                p_idef['file_mask'] = p_si.get('file_mask')
+                p_idef['embedded_mask'] = embedded_mask
+                p_idef['mask_applied'] = apply_mask
                 mod_v = p_si['mod_val']
                 if mod_v is not None:
                     dec = np.where(np.isfinite(base_dec), base_dec % mod_v, base_dec)
@@ -1643,6 +2239,13 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False):
     palette.geometry(f'{PAL_W}x{pal_h}+{PAL_X}+{PAL_Y}')
     root.geometry(f'{win_w}x{win_h}+{IMG_X}+{IMG_Y}')
 
+    # ---- GeoPackage legend window: opposite the Controls palette, top-aligned
+    #      with the image window (mirrors to the image's left when rtl, since
+    #      Controls itself is on the right in that layout) ----
+    if gpkg_overlay is not None:
+        openGpkgLegend(gpkg_overlay, parent=root, on_change=recolor_gpkg,
+                       anchor=(IMG_X, IMG_Y, win_w), rtl=rtl)
+
     root.mainloop()
 
 
@@ -1671,8 +2274,8 @@ def _computeDiffArray(a, b, add_mode):
 
 def _injectDiff(image_defs, add_mode):
     """Append a difference (or sum) pane from the first two entries of image_defs."""
-    a = image_defs[0]['base']
-    b = image_defs[1]['base']
+    a = image_defs[0].get('raw_unmasked', image_defs[0]['base'])
+    b = image_defs[1].get('raw_unmasked', image_defs[1]['base'])
     if a.shape != b.shape:
         sys.exit(f'--diff: image shapes differ ({a.shape} vs {b.shape}); '
                  'both inputs must be the same size')
@@ -1693,18 +2296,22 @@ def _injectDiff(image_defs, add_mode):
         'col_coord_label': image_defs[0].get('col_coord_label'),
         'row_coord_label': image_defs[0].get('row_coord_label'),
         'origin_lower': image_defs[0].get('origin_lower', False),
+        'geotransform': image_defs[0].get('geotransform'),
+        'dec_factor': image_defs[0].get('dec_factor', 1),
         'is_rgb': False,
         'is_diff': True,
         'add_mode': add_mode,
     })
 
 
-def resolveFilename(f):
+def resolveFilename(f, vel=False):
     """Return (resolved_path, is_geodat).
 
     If f exists and GDAL can open it, return (f, False).
     Otherwise try, in priority order, f+'.vrt', f+'.tif', f+'.h5'/'.he5'/'.hdf5'
-    (NISAR), then check for f+'.geodat' sidecar (geoimage scalar: data in f,
+    (NISAR). If vel is True, next check for a GrIMP velocity geodat pair
+    (f+'.vx', f+'.vy', metadata in f+'.vx.geodat') and return (f, 'vel').
+    Otherwise check for f+'.geodat' sidecar (geoimage scalar: data in f,
     metadata in f.geodat).
     Exits with an error if nothing is found.
     """
@@ -1725,21 +2332,40 @@ def resolveFilename(f):
         cand = f + ext
         if os.path.exists(cand):
             return cand, False
+    if vel and os.path.exists(f + '.vx.geodat'):
+        return f, 'vel'
     if os.path.exists(f + '.geodat'):
         return f, True
+    extra = f' or {f}.vx.geodat' if vel else ''
     sys.exit(f'showimage: cannot find {f!r} '
-             f'(tried {f}.vrt, {f}.tif, {f}.h5; geodat sidecar {f}.geodat not found)')
+             f'(tried {f}.vrt, {f}.tif, {f}.h5; geodat sidecar {f}.geodat{extra} not found)')
 
 
-def geodatToGdalMem(f):
-    """Read a GrIMP scalar geodat binary image and return a GDAL MEM dataset."""
+def _epsgToWkt(epsg):
+    """Return the WKT for an EPSG code (or None), for tagging a geodat MEM
+    dataset's projection -- geodat images carry no embedded CRS of their own."""
+    if epsg is None:
+        return None
+    from osgeo import osr
+    srs = osr.SpatialReference()
+    if srs.ImportFromEPSG(epsg) != 0:
+        sys.exit(f'showimage: invalid EPSG code {epsg}')
+    return srs.ExportToWkt()
+
+
+def geodatToGdalMem(f, dType='>f4', epsg=None):
+    """Read a GrIMP scalar geodat binary image and return a GDAL MEM dataset.
+
+    dType selects the on-disk sample type ('>f4' float32 default, 'u1' byte,
+    '>i2' int16 -- see --byte/--shortint). epsg, if given, sets the dataset's
+    projection (geodat images have no embedded CRS)."""
     try:
         from utilities.geoimage import geoimage as Geoimage
     except ImportError:
         sys.exit('showimage: utilities.geoimage not available — cannot read geodat files')
     gi = Geoimage(verbose=False)
     try:
-        gi.readData(f, geoType='scalar')
+        gi.readData(f, geoType='scalar', dType=dType, epsg=epsg)
     except Exception as exc:
         sys.exit(f'showimage: cannot read geodat image {f!r}: {exc}')
     arr = np.asarray(gi.x, dtype=np.float32)
@@ -1752,9 +2378,47 @@ def geodatToGdalMem(f):
     driver = gdal.GetDriverByName('MEM')
     mem_ds = driver.Create('', nx, ny, 1, gdal.GDT_Float32)
     mem_ds.SetGeoTransform(gt)
+    wkt = _epsgToWkt(epsg)
+    if wkt:
+        mem_ds.SetProjection(wkt)
     band = mem_ds.GetRasterBand(1)
     band.WriteArray(arr)
     band.SetNoDataValue(-2e9)
+    return mem_ds
+
+
+def velGeodatToGdalMem(f, epsg=None):
+    """Read a GrIMP velocity geodat pair (f.vx/f.vy, metadata in f.vx.geodat)
+    and return a 2-band GDAL MEM dataset (band 1 = vx, band 2 = vy). Velocity
+    components are always float32, so --byte/--shortint do not apply; epsg, if
+    given, sets the dataset's projection (geodat has no embedded CRS)."""
+    try:
+        from utilities.geoimage import geoimage as Geoimage
+    except ImportError:
+        sys.exit('showimage: utilities.geoimage not available — cannot read geodat files')
+    gi = Geoimage(verbose=False)
+    try:
+        gi.readData(f, geoType='velocity', epsg=epsg)
+    except Exception as exc:
+        sys.exit(f'showimage: cannot read velocity geodat image {f!r}: {exc}')
+    vx = np.asarray(gi.vx, dtype=np.float32)
+    vy = np.asarray(gi.vy, dtype=np.float32)
+    ny, nx = vx.shape
+    x0 = float(gi.xx[0]) * 1000.0
+    dx = float(gi.xx[1] - gi.xx[0]) * 1000.0 if nx > 1 else 1.0
+    y0 = float(gi.yy[0]) * 1000.0
+    dy = float(gi.yy[1] - gi.yy[0]) * 1000.0 if ny > 1 else -1.0
+    gt = (x0, dx, 0.0, y0, 0.0, dy)
+    driver = gdal.GetDriverByName('MEM')
+    mem_ds = driver.Create('', nx, ny, 2, gdal.GDT_Float32)
+    mem_ds.SetGeoTransform(gt)
+    wkt = _epsgToWkt(epsg)
+    if wkt:
+        mem_ds.SetProjection(wkt)
+    for i, arr in enumerate((vx, vy), start=1):
+        band = mem_ds.GetRasterBand(i)
+        band.WriteArray(arr)
+        band.SetNoDataValue(-2e9)
     return mem_ds
 
 
@@ -1778,11 +2442,24 @@ def main():
                         help='Decimation factor (default: auto-fit to screen)')
     parser.add_argument('--fullRes', action='store_true',
                         help='Display at full resolution (equivalent to --decFactor 1)')
+    _geodat_dtype = parser.add_mutually_exclusive_group()
+    _geodat_dtype.add_argument('--byte', action='store_true',
+                        help='Read a geodat image as unsigned byte (u1) instead '
+                             'of the default big-endian float32 (geodat input only)')
+    _geodat_dtype.add_argument('--shortint', action='store_true',
+                        help='Read a geodat image as big-endian int16 (>i2) instead '
+                             'of the default float32 (geodat input only)')
+    parser.add_argument('--epsg', type=int, default=None, metavar='CODE',
+                        help='EPSG code for the CRS of a geodat image (e.g. 3413 '
+                             'Greenland, 3031 Antarctica); sets the projection on '
+                             'the read (geodat has no embedded CRS) so overlays/'
+                             'coordinates are placed correctly')
     parser.add_argument('-decFactor', type=int, default=None, dest='decFactor',
                         help=argparse.SUPPRESS)
     parser.add_argument('--vel', action='store_true',
-                        help='Read vx+vy from a 2-band VRT; display speed = sqrt(vx²+vy²) '
-                             'mod 100 (use --mod to override the modulus)')
+                        help='Read vx+vy from a 2-band VRT (1-3 files, side by side); '
+                             'display speed = sqrt(vx²+vy²) mod 100 '
+                             '(use --mod to override the modulus)')
     parser.add_argument('--mod', type=float, default=None, metavar='X',
                         help='Display image modulo X '
                              '(default: 100 with --vel, off otherwise)')
@@ -1813,18 +2490,42 @@ def main():
                         help='Show two images and their sum as a third pane '
                              '(pane 3 = pane 1 + pane 2, RdBu colormap, auto-scaled '
                              'symmetrically). Requires exactly 2 files or 2 --bands.')
-    _mask_group = parser.add_mutually_exclusive_group()
-    _mask_group.add_argument('--mask', default=None, metavar='MASKFILE',
+    parser.add_argument('--mask', default=None, metavar='MASKFILE',
                         help='Single-band mask file; pixels where the mask is 0 are '
-                             'set to noData in all displayed images')
-    _mask_group.add_argument('--invMask', default=None, metavar='MASKFILE',
-                        help='Single-band mask file; pixels where the mask is non-zero '
-                             'are set to noData in all displayed images '
-                             '(opposite of --mask)')
+                             'treated as invalid. Handled exactly like a file\'s own '
+                             'embedded mask band: honored by default, toggleable via the '
+                             'Mask button in the control palette (not baked in '
+                             'permanently). An InvMask button also appears to flip which '
+                             'sense counts as valid, replacing the old separate -invMask flag')
+    _gpkg_group = parser.add_argument_group('Vector overlay (GeoPackage / shapefile)')
+    _gpkg_group.add_argument('--gpkg', '--shp', '--vector', dest='gpkg',
+                        default=None, metavar='FILE',
+                        help='Overlay Point/LineString/Polygon features from a GeoPackage, '
+                             'shapefile, or any other OGR vector source on top of the '
+                             'displayed raster(s) (--shp/--vector are aliases). '
+                             'The Legend window includes a dropdown to pick/switch which '
+                             'attribute field colors the overlay (default: --attribute, or '
+                             'the first field if not given). The vector layer must already '
+                             'be in the same projected CRS as the raster(s) -- no '
+                             'reprojection is done. Not supported for NISAR HDF5 input.')
+    _gpkg_group.add_argument('--attribute', default=None, metavar='FIELD',
+                        help='Initial attribute field to color --gpkg features by (numeric '
+                             'fields use a continuous colormap; other fields use a fixed '
+                             'categorical palette). Default: the first field in the layer. '
+                             'Switch fields later from the Legend window\'s dropdown.')
+    _gpkg_group.add_argument('--gpkgLayer', default=None, metavar='NAME',
+                        help='Layer name within --gpkg (default: first layer)')
+    _gpkg_group.add_argument('--gpkgCmap', default='viridis', metavar='CMAP',
+                        help='Colormap for a numeric --attribute (default: viridis)')
+    _gpkg_group.add_argument('--gpkgSize', type=float, default=4.0, metavar='PX',
+                        help='Point marker radius in pixels (default: 4)')
+    _gpkg_group.add_argument('--gpkgFill', action='store_true',
+                        help='Fill polygons (stippled) instead of outline-only '
+                             '(default: outline-only, so the underlying image stays visible)')
     args = parser.parse_args()
 
-    if args.vel and len(args.files) != 1:
-        sys.exit('--vel requires exactly one input file')
+    if args.vel and len(args.files) > 3:
+        sys.exit('showimage: at most 3 files can be displayed with --vel')
     if args.log and not args.vel:
         sys.exit('--log requires --vel')
     if args.bands and args.vel:
@@ -1835,19 +2536,19 @@ def main():
         sys.exit('--bands: at most 3 band names allowed')
     args.combine = args.diff or args.add
     if args.combine:
-        if args.vel:
-            sys.exit('--diff/--add is not compatible with --vel')
         n_src = len(args.bands) if args.bands else len(args.files)
         if n_src != 2:
             sys.exit('--diff/--add requires exactly 2 sources (2 files or --bands with 2 band names)')
-    if not args.vel and not args.bands and not args.combine and len(args.files) > 3:
+    if not args.bands and not args.combine and len(args.files) > 3:
         sys.exit('showimage: at most 3 files can be displayed simultaneously')
+    if args.attribute and not args.gpkg:
+        sys.exit('--attribute requires --gpkg')
 
     # Resolve filenames: fall back to .vrt, .tif, .geodat if bare name not found
     resolved_files = []
     geodat_flags = []
     for f in args.files:
-        rpath, is_gd = resolveFilename(f)
+        rpath, is_gd = resolveFilename(f, vel=args.vel)
         if rpath != f:
             print(f'showimage: {f!r} not found, using {rpath!r}')
         resolved_files.append(rpath)
@@ -1863,8 +2564,10 @@ def main():
     if is_nisar:
         if args.vel:
             sys.exit('showimage: --vel is not supported for NISAR HDF5 files')
-        if args.mask or args.invMask:
-            sys.exit('showimage: --mask/--invMask are not supported for NISAR HDF5 files')
+        if args.mask:
+            sys.exit('showimage: --mask is not supported for NISAR HDF5 files')
+        if args.gpkg:
+            sys.exit('showimage: --gpkg is not supported for NISAR HDF5 files')
 
         sw, sh = getScreenSize()
         nisar_infos = []
@@ -2000,46 +2703,59 @@ def main():
 
     gdal.UseExceptions()
 
+    # geodat sample type from --byte/--shortint (mutually exclusive); default
+    # is the legacy big-endian float32. Only meaningful for scalar geodat input.
+    geodat_dtype = 'u1' if args.byte else '>i2' if args.shortint else '>f4'
+    if (args.byte or args.shortint) and not any(g and g != 'vel' for g in geodat_flags):
+        print('showimage: --byte/--shortint only apply to scalar geodat input '
+              '— ignoring', file=sys.stderr)
+
     datasets = []
     for f, is_geodat in zip(args.files, geodat_flags):
         try:
-            datasets.append(geodatToGdalMem(f) if is_geodat else gdal.Open(f))
+            if is_geodat == 'vel':
+                datasets.append(velGeodatToGdalMem(f, epsg=args.epsg))
+            elif is_geodat:
+                datasets.append(geodatToGdalMem(f, dType=geodat_dtype,
+                                                epsg=args.epsg))
+            else:
+                datasets.append(gdal.Open(f))
         except Exception as e:
             sys.exit(f'Cannot open {f}: {e}')
 
     mask_arr = None
-    mask_invert = False
-    if args.mask or args.invMask:
-        mask_file = args.mask or args.invMask
-        mask_invert = args.invMask is not None
-        mask_file, mask_is_geodat = resolveFilename(mask_file)
+    if args.mask:
+        mask_file, mask_is_geodat = resolveFilename(args.mask)
         try:
-            mask_ds = geodatToGdalMem(mask_file) if mask_is_geodat else gdal.Open(mask_file)
+            # A geodat mask is only compared !=0, so its sample type doesn't
+            # matter for masking -- but honor --byte/--shortint/--epsg so it
+            # reads and georeferences the same way as the image geodat would.
+            mask_ds = (geodatToGdalMem(mask_file, dType=geodat_dtype,
+                                       epsg=args.epsg)
+                       if mask_is_geodat else gdal.Open(mask_file))
         except Exception as e:
             sys.exit(f'Cannot open mask file {mask_file}: {e}')
         mask_arr = mask_ds.GetRasterBand(1).ReadAsArray()
         mask_ds = None
 
-    def applyMask(full_arr):
-        """Set masked pixels to NaN in a full-resolution array (before decimation)."""
+    def externalFileMask(full_shape, factor):
+        """Decimated boolean 'valid where --mask's raw value != 0' array matching a
+        pane's own decimation, or None if no --mask was given or its shape doesn't
+        match this image. Unlike the old applyMask(), this is NOT baked into the
+        data -- it's combined with any embedded VRT mask (see combineMasks()) into
+        the same toggleable/invertible mechanism, applied at display time."""
         if mask_arr is None:
-            return full_arr
-        if mask_arr.shape[:2] != full_arr.shape[:2]:
+            return None
+        if mask_arr.shape[:2] != full_shape[:2]:
             print(f'showimage: mask shape {mask_arr.shape[:2]} does not match '
-                  f'image shape {full_arr.shape[:2]} — skipping mask',
-                  file=sys.stderr)
-            return full_arr
-        out = full_arr.astype(np.float32, copy=True)
-        if mask_invert:
-            out[mask_arr != 0] = np.nan
-        else:
-            out[mask_arr == 0] = np.nan
-        return out
+                 f'image shape {full_shape[:2]} — skipping mask', file=sys.stderr)
+            return None
+        return decimateMask(mask_arr != 0, factor)
 
     sizes = [(ds.RasterXSize, ds.RasterYSize) for ds in datasets]
-    nx, ny = sizes[0]  # used by --vel and --bands (single-file paths)
+    nx, ny = sizes[0]  # used by --bands (single-file path)
     sw, sh = getScreenSize()
-    n_display = 1 if args.vel else (len(args.bands) if args.bands else len(args.files))
+    n_display = len(args.bands) if args.bands else len(args.files)
     if args.combine:
         n_display += 1
     _inject_raw = (args.mod is not None and not args.vel and not args.bands
@@ -2058,71 +2774,108 @@ def main():
     image_defs = []
 
     if args.vel:
-        ds = datasets[0]
-        f  = args.files[0]
-        _gt_v = ds.GetGeoTransform()
-        _ol = _gt_v[5] > 0 or isNisarOriginLowerProduct(f)
-        if ds.RasterCount < 2:
-            sys.exit('--vel: file must have at least 2 bands (vx, vy)')
         if mod_val is None:
             mod_val = 100.0
-        vx = applyMask(readBand(ds, 1))
-        vy = applyMask(readBand(ds, 2))
-        speed = np.where(np.isfinite(vx) & np.isfinite(vy),
-                         np.sqrt(vx**2 + vy**2), np.nan)
-        dec = blockAverage(speed, factor)
-        _ny_d, _nx_d = dec.shape[:2]
-        _col_c_v = _gt_v[3] + np.arange(_ny_d) * _gt_v[5] * factor
-        _row_c_v = _gt_v[0] + np.arange(_nx_d) * _gt_v[1] * factor
-        if args.log:
-            sv_min = args.vmin if args.vmin is not None else 1.0
-            sv_max = args.vmax if args.vmax is not None else 3000.0
-            raw = dec.copy()
-            dec = hsvSpeedRender(dec, sv_min, sv_max)
-            print(f'{f}: {nx}×{ny} px, speed log HSV {sv_min}–{sv_max} m/yr, '
-                  f'decimation ×{factor}')
-            image_defs.append({
-                'dec': dec,
-                'raw': raw,
-                'base': raw,
-                'mod_val': None,
-                'vmin_arg': args.vmin,
-                'vmax_arg': args.vmax,
-                'title': f'speed log HSV: {f}',
-                'cmap': args.cmap,
-                'vmin': None,
-                'vmax': None,
-                'col_coords': _col_c_v,
-                'row_coords': _row_c_v,
-                'col_coord_label': 'Y coordinate',
-                'row_coord_label': 'X coordinate',
-                'origin_lower': _ol,
-                'is_rgb': True,
-            })
-        else:
-            base_dec = dec.copy()
-            dec = np.where(np.isfinite(base_dec), base_dec % mod_val, base_dec)
-            vmin = args.vmin if args.vmin is not None else 0.0
-            vmax = args.vmax if args.vmax is not None else mod_val
-            print(f'{f}: {nx}×{ny} px, speed from bands 1+2, mod {mod_val:.4g}, '
-                  f'decimation ×{factor}')
-            image_defs.append({
-                'dec': dec,
-                'base': base_dec,
-                'mod_val': mod_val,
-                'vmin_arg': args.vmin,
-                'vmax_arg': args.vmax,
-                'title': f'speed mod {mod_val:.4g}: {f}',
-                'cmap': args.cmap,
-                'vmin': vmin,
-                'vmax': vmax,
-                'col_coords': _col_c_v,
-                'row_coords': _row_c_v,
-                'col_coord_label': 'Y coordinate',
-                'row_coord_label': 'X coordinate',
-                'origin_lower': _ol,
-                'is_rgb': False,
-            })
+        for ds, f in zip(datasets, args.files):
+            nx_i, ny_i = ds.RasterXSize, ds.RasterYSize
+            _gt_v = ds.GetGeoTransform()
+            _ol = _gt_v[5] > 0 or isNisarOriginLowerProduct(f)
+            if ds.RasterCount < 2:
+                sys.exit(f'--vel: file {f} must have at least 2 bands (vx, vy)')
+            if args.fullRes:
+                fi = 1
+            elif args.decFactor is not None:
+                fi = max(1, args.decFactor)
+            else:
+                fi = max(1, math.ceil(nx_i * n_display / sw), math.ceil(ny_i / sh))
+            vx = readBand(ds, 1)
+            vy = readBand(ds, 2)
+            speed = np.where(np.isfinite(vx) & np.isfinite(vy),
+                             np.sqrt(vx**2 + vy**2), np.nan)
+            raw_unmasked = blockAverage(speed, fi)
+            vrt_mask1 = readMaskBand(ds, 1)
+            vrt_mask2 = readMaskBand(ds, 2)
+            if vrt_mask1 is not None and vrt_mask2 is not None:
+                vrt_mask_full = vrt_mask1 & vrt_mask2
+            else:
+                vrt_mask_full = vrt_mask1 if vrt_mask1 is not None else vrt_mask2
+            vrt_mask = decimateMask(vrt_mask_full, fi) if vrt_mask_full is not None else None
+            file_mask = externalFileMask(vx.shape, fi)
+            embedded_mask = combineMasks(vrt_mask, file_mask)
+            dec = (np.where(embedded_mask, raw_unmasked, np.nan)
+                  if embedded_mask is not None else raw_unmasked)
+            _ny_d, _nx_d = dec.shape[:2]
+            _col_c_v = _gt_v[3] + np.arange(_ny_d) * _gt_v[5] * fi
+            _row_c_v = _gt_v[0] + np.arange(_nx_d) * _gt_v[1] * fi
+            if args.log:
+                sv_min = args.vmin if args.vmin is not None else 1.0
+                sv_max = args.vmax if args.vmax is not None else 3000.0
+                raw = dec.copy()
+                dec = hsvSpeedRender(dec, sv_min, sv_max)
+                print(f'{f}: {nx_i}×{ny_i} px, speed log HSV {sv_min}–{sv_max} m/yr, '
+                      f'decimation ×{fi}'
+                     + (' (mask honored by default)' if embedded_mask is not None else ''))
+                image_defs.append({
+                    'dec': dec,
+                    'raw': raw,
+                    'base': raw,
+                    'raw_unmasked': raw_unmasked,
+                    'vrt_mask': vrt_mask,
+                    'file_mask': file_mask,
+                    'embedded_mask': embedded_mask,
+                    'mask_applied': embedded_mask is not None,
+                    'mod_val': None,
+                    'vmin_arg': args.vmin,
+                    'vmax_arg': args.vmax,
+                    'title': f'speed log HSV: {f}',
+                    'cmap': args.cmap,
+                    'vmin': None,
+                    'vmax': None,
+                    'col_coords': _col_c_v,
+                    'row_coords': _row_c_v,
+                    'col_coord_label': 'Y coordinate',
+                    'row_coord_label': 'X coordinate',
+                    'origin_lower': _ol,
+                    'geotransform': _gt_v,
+                    'dec_factor': fi,
+                    'is_rgb': True,
+                    # recolor_gpkg-style helper for the Mask toggle: HSV rendering can't
+                    # just be masked with np.where after the fact (it's already RGB), so
+                    # showImage() needs to know how to rebuild it from raw speed values.
+                    'hsv_render': (sv_min, sv_max),
+                })
+            else:
+                base_dec = dec.copy()
+                dec = np.where(np.isfinite(base_dec), base_dec % mod_val, base_dec)
+                vmin = args.vmin if args.vmin is not None else 0.0
+                vmax = args.vmax if args.vmax is not None else mod_val
+                print(f'{f}: {nx_i}×{ny_i} px, speed from bands 1+2, mod {mod_val:.4g}, '
+                      f'decimation ×{fi}'
+                     + (' (mask honored by default)' if embedded_mask is not None else ''))
+                image_defs.append({
+                    'dec': dec,
+                    'base': base_dec,
+                    'raw_unmasked': raw_unmasked,
+                    'vrt_mask': vrt_mask,
+                    'file_mask': file_mask,
+                    'embedded_mask': embedded_mask,
+                    'mask_applied': embedded_mask is not None,
+                    'mod_val': mod_val,
+                    'vmin_arg': args.vmin,
+                    'vmax_arg': args.vmax,
+                    'title': f'speed mod {mod_val:.4g}: {f}',
+                    'cmap': args.cmap,
+                    'vmin': vmin,
+                    'vmax': vmax,
+                    'col_coords': _col_c_v,
+                    'row_coords': _row_c_v,
+                    'col_coord_label': 'Y coordinate',
+                    'row_coord_label': 'X coordinate',
+                    'origin_lower': _ol,
+                    'geotransform': _gt_v,
+                    'dec_factor': fi,
+                    'is_rgb': False,
+                })
     elif args.bands:
         ds = datasets[0]
         f  = args.files[0]
@@ -2134,20 +2887,34 @@ def main():
                 print(f'showimage: band "{bname}" not found in {f} — skipping',
                       file=sys.stderr)
                 continue
-            base_dec = blockAverage(applyMask(readBand(ds, bnum)), factor)
+            raw_band = readBand(ds, bnum)
+            raw_unmasked = blockAverage(raw_band, factor)
+            vrt_mask_full = readMaskBand(ds, bnum)
+            vrt_mask = decimateMask(vrt_mask_full, factor) if vrt_mask_full is not None else None
+            file_mask = externalFileMask(raw_band.shape, factor)
+            embedded_mask = combineMasks(vrt_mask, file_mask)
+            base_dec = (np.where(embedded_mask, raw_unmasked, np.nan)
+                       if embedded_mask is not None else raw_unmasked)
             dec = (np.where(np.isfinite(base_dec), base_dec % mod_val, base_dec)
                    if mod_val is not None else base_dec)
+            _pct_src = dec if np.any(np.isfinite(dec)) else raw_unmasked
             vmin = args.vmin if args.vmin is not None else (
-                0.0 if mod_val is not None else np.nanpercentile(dec, 2))
+                0.0 if mod_val is not None else float(np.nanpercentile(_pct_src, 2)))
             vmax = args.vmax if args.vmax is not None else (
-                mod_val if mod_val is not None else np.nanpercentile(dec, 98))
-            print(f'{f} [{bname}]: {nx}×{ny} px, decimation ×{factor}')
+                mod_val if mod_val is not None else float(np.nanpercentile(_pct_src, 98)))
+            print(f'{f} [{bname}]: {nx}×{ny} px, decimation ×{factor}'
+                 + (' (mask honored by default)' if embedded_mask is not None else ''))
             _ny_d, _nx_d = base_dec.shape[:2]
             _col_c = _gt_b[3] + np.arange(_ny_d) * _gt_b[5] * factor
             _row_c = _gt_b[0] + np.arange(_nx_d) * _gt_b[1] * factor
             image_defs.append({
                 'dec': dec,
                 'base': base_dec,
+                'raw_unmasked': raw_unmasked,
+                'vrt_mask': vrt_mask,
+                'file_mask': file_mask,
+                'embedded_mask': embedded_mask,
+                'mask_applied': embedded_mask is not None,
                 'mod_val': mod_val,
                 'vmin_arg': args.vmin,
                 'vmax_arg': args.vmax,
@@ -2160,6 +2927,8 @@ def main():
                 'col_coord_label': 'Y coordinate',
                 'row_coord_label': 'X coordinate',
                 'origin_lower': _ol,
+                'geotransform': _gt_b,
+                'dec_factor': factor,
                 'is_rgb': False,
             })
         if not image_defs:
@@ -2187,20 +2956,39 @@ def main():
                 print(f'    showimage [options] {os.path.basename(f)} --bands {suggestion}')
                 print(f'  Available bands: {", ".join(bnames)}')
 
-            base_dec = blockAverage(applyMask(readBand(ds, 1)), fi)
+            raw_band = readBand(ds, 1)
+            raw_unmasked = blockAverage(raw_band, fi)
+            vrt_mask_full = readMaskBand(ds, 1)
+            vrt_mask = decimateMask(vrt_mask_full, fi) if vrt_mask_full is not None else None
+            file_mask = externalFileMask(raw_band.shape, fi)
+            embedded_mask = combineMasks(vrt_mask, file_mask)
+            # Masks (embedded VRT and/or external --mask) are honored by default
+            # (matches the GIT64 C binaries' '-noMask' convention); the Mask button
+            # in showImage() toggles this off, InvMask flips its sense.
+            base_dec = (np.where(embedded_mask, raw_unmasked, np.nan)
+                       if embedded_mask is not None else raw_unmasked)
             dec = (np.where(np.isfinite(base_dec), base_dec % mod_val, base_dec)
                    if mod_val is not None else base_dec)
+            _pct_src = dec if np.any(np.isfinite(dec)) else raw_unmasked
             vmin = args.vmin if args.vmin is not None else (
-                0.0 if mod_val is not None else np.nanpercentile(dec, 2))
+                0.0 if mod_val is not None else float(np.nanpercentile(_pct_src, 2)))
             vmax = args.vmax if args.vmax is not None else (
-                mod_val if mod_val is not None else np.nanpercentile(dec, 98))
+                mod_val if mod_val is not None else float(np.nanpercentile(_pct_src, 98)))
             _ny_d, _nx_d = base_dec.shape[:2]
             _col_c = _gt_i[3] + np.arange(_ny_d) * _gt_i[5] * fi
             _row_c = _gt_i[0] + np.arange(_nx_d) * _gt_i[1] * fi
+            if embedded_mask is not None:
+                print(f'  Mask found (embedded and/or --mask) -- honored by default '
+                     f'(Mask button to toggle, InvMask to flip sense)')
 
             image_defs.append({
                 'dec': dec,
                 'base': base_dec,
+                'raw_unmasked': raw_unmasked,
+                'vrt_mask': vrt_mask,
+                'file_mask': file_mask,
+                'embedded_mask': embedded_mask,
+                'mask_applied': embedded_mask is not None,
                 'mod_val': mod_val,
                 'vmin_arg': args.vmin,
                 'vmax_arg': args.vmax,
@@ -2213,6 +3001,8 @@ def main():
                 'col_coord_label': 'Y coordinate',
                 'row_coord_label': 'X coordinate',
                 'origin_lower': _ol,
+                'geotransform': _gt_i,
+                'dec_factor': fi,
                 'is_rgb': False,
             })
 
@@ -2236,6 +3026,13 @@ def main():
             'col_coord_label': idef0.get('col_coord_label'),
             'row_coord_label': idef0.get('row_coord_label'),
             'origin_lower': idef0.get('origin_lower', False),
+            'geotransform': idef0.get('geotransform'),
+            'dec_factor': idef0.get('dec_factor', 1),
+            'raw_unmasked': idef0.get('raw_unmasked'),
+            'vrt_mask': idef0.get('vrt_mask'),
+            'file_mask': idef0.get('file_mask'),
+            'embedded_mask': idef0.get('embedded_mask'),
+            'mask_applied': idef0.get('mask_applied', False),
             'is_rgb': False,
         })
 
@@ -2245,7 +3042,10 @@ def main():
             {'ds': ds, 'factor': fi, 'mod_val': mod_val,
              'cmap': args.cmap, 'vmin_arg': args.vmin, 'vmax_arg': args.vmax,
              'cache': None if args.noCache else {},
-             'mask_arr': mask_arr, 'mask_invert': mask_invert}
+             # Same for every band of this file (the external --mask file doesn't
+             # depend on which band is displayed) -- computed once here rather
+             # than re-checked/re-decimated on every band switch.
+             'file_mask': externalFileMask((ds.RasterYSize, ds.RasterXSize), fi)}
             if ds.RasterCount > 1 else None
             for ds, fi in zip(datasets, factors_per_file)
         ]
@@ -2262,7 +3062,36 @@ def main():
         if switch_infos is not None:
             switch_infos = list(switch_infos) + [None]
 
-    showImage(image_defs, sw, sh, switch_infos=switch_infos, rtl=args.right)
+    gpkg_overlay = None
+    if args.gpkg:
+        overlay_data = readGpkgOverlay(args.gpkg, layer_name=args.gpkgLayer)
+        attribute = args.attribute or overlay_data['field_names'][0]
+        if attribute not in overlay_data['fields']:
+            sys.exit(f"showimage: attribute {attribute!r} not found in {args.gpkg!r} "
+                     f"(available: {', '.join(overlay_data['field_names'])})")
+        fvals = overlay_data['fields'][attribute]
+        colors, legend = buildGpkgColors(fvals['values'], fvals['is_numeric'],
+                                         cmap_name=args.gpkgCmap)
+        gpkg_overlay = {
+            'geom_type': overlay_data['geom_type'],
+            'geoms': overlay_data['geoms'],
+            'fields': overlay_data['fields'],
+            'field_names': overlay_data['field_names'],
+            'colors': colors,
+            'legend': legend,
+            'attribute': attribute,
+            'cmap': args.gpkgCmap,
+            'point_radius': args.gpkgSize,
+            'fill_polygons': args.gpkgFill,
+        }
+        print(f"showimage: overlaying {len(overlay_data['geoms'])} "
+              f"{overlay_data['geom_type']} feature(s) from {args.gpkg}, "
+              f"colored by '{attribute}'"
+              f"{' (numeric)' if fvals['is_numeric'] else ' (categorical)'}"
+              f"  ({len(overlay_data['field_names'])} field(s) available)")
+
+    showImage(image_defs, sw, sh, switch_infos=switch_infos, rtl=args.right,
+             gpkg_overlay=gpkg_overlay)
 
 
 def showvel():

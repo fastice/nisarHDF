@@ -117,6 +117,7 @@ class nisarRIFGHDF(nisarBaseRangeDopplerHDF):
                              referenceOrbitXML=self.secondaryOrbitXML,
                              debug=self.debug)
             self.secondary.h5 = self.h5
+            self.secondary.CRID = getattr(self, 'CRID', None)
             self.secondary.parseParams(secondary=True, referenceOrbit=self.secondaryOrbit)
             #self.secondaryDatetime = self.secondary.datetime
             #self.secondaryDate = self.secondary.datetime

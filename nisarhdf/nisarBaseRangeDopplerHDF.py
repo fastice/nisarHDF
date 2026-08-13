@@ -626,6 +626,7 @@ class nisarBaseRangeDopplerHDF(nisarBaseHDF):
         #
         self.geodatDict['orbit'] = self.referenceOrbit
         self.geodatDict['frame'] = self.frame
+        self.geodatDict['CRID'] = getattr(self, 'CRID', None)
         #
         # Now append the state vectors
         for sv in self.orbit.stateVectors:
