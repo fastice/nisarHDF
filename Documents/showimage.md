@@ -20,7 +20,7 @@ showimage [options] FILE [FILE ...]
 
 | Argument | Description |
 |---|---|
-| `FILE` | Input file(s) — up to 3; `.h5`/`.he5`/`.hdf5` for NISAR, `.vrt`/`.tif`/`.tiff` for GDAL |
+| `FILE` | Input file(s) — up to 3; `.h5`/`.he5`/`.hdf5` for NISAR, `.vrt`/`.tif`/`.tiff` for GDAL, or a raw S1 `.pow` with a shared multilook geodat (see "Raw S1 power images") |
 
 **Display options:**
 
@@ -66,6 +66,28 @@ showimage [options] FILE [FILE ...]
 | `--freq FREQ` | `frequencyA` | Frequency band to display |
 | `--pol POL` | auto-detect | Polarization (e.g. `HH`, `VV`) |
 | `--noCache` | — | Disable decimated-band cache; reduces memory use at the cost of re-reading from disk on each band switch |
+
+## Raw S1 power images (`.pow`)
+
+A raw headerless S1 power image named `P<scene>.<looks>.pow` (e.g. `P63811_669.10x2.pow`)
+is displayed directly when a matching **shared multilook geodat** sits beside it —
+`geodat<looks>.geojson` (preferred) or `geodat<looks>.in`, where `<looks>` is the token
+just before `.pow` (`10x2` above), following the s1setup layout (`cloneSLCdir.py`). The
+geodat supplies the grid dimensions (`nr` range × `na` azimuth, read via
+`utilities.geodatrxa`); the `.pow` itself is read as **byte-swapped (big-endian) binary
+float32**, stored azimuth-major.
+
+The viewer shows the **amplitude = √power** (the square root compresses the dynamic range;
+negative/border samples clip to 0). No map geotransform is applied — a `.pow` is in radar
+(range/azimuth) geometry, so `--epsg`, `--gpkg`, and coordinate overlays don't apply. A
+`.pow` files sometimes carry a few extra trailing azimuth rows beyond what the geodat
+records; when the file is **longer** than the geodat's `na×nr`, the surplus is dropped (the
+first `na×nr` samples are read) with a note on stderr. Only a file **shorter** than `na×nr`
+is an error — usually a sign the wrong-`<looks>` geodat was picked up.
+
+```
+showimage P63811_669.10x2.pow          # amplitude, sized from geodat10x2.geojson/.in
+```
 
 ## Multi-image display
 

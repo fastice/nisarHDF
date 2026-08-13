@@ -2313,6 +2313,9 @@ def resolveFilename(f, vel=False):
     (f+'.vx', f+'.vy', metadata in f+'.vx.geodat') and return (f, 'vel').
     Otherwise check for f+'.geodat' sidecar (geoimage scalar: data in f,
     metadata in f.geodat).
+    Otherwise, if f is a raw S1 power image ('*.<looks>.pow') with a matching
+    shared multilook geodat beside it (geodat<looks>.geojson/.in -- see
+    findPowGeodat), return (f, 'pow').
     Exits with an error if nothing is found.
     """
     if os.path.exists(f):
@@ -2336,9 +2339,12 @@ def resolveFilename(f, vel=False):
         return f, 'vel'
     if os.path.exists(f + '.geodat'):
         return f, True
+    if os.path.exists(f) and findPowGeodat(f) is not None:
+        return f, 'pow'
     extra = f' or {f}.vx.geodat' if vel else ''
     sys.exit(f'showimage: cannot find {f!r} '
-             f'(tried {f}.vrt, {f}.tif, {f}.h5; geodat sidecar {f}.geodat{extra} not found)')
+             f'(tried {f}.vrt, {f}.tif, {f}.h5; geodat sidecar {f}.geodat{extra}; '
+             'shared geodat<looks>.geojson/.in for a .pow — none found)')
 
 
 def _epsgToWkt(epsg):
@@ -2419,6 +2425,78 @@ def velGeodatToGdalMem(f, epsg=None):
         band = mem_ds.GetRasterBand(i)
         band.WriteArray(arr)
         band.SetNoDataValue(-2e9)
+    return mem_ds
+
+
+def findPowGeodat(f):
+    """For a raw S1 power image named like 'P<scene>.<looks>.pow' (e.g.
+    'P63811_669.10x2.pow'), return the shared multilook geodat describing its
+    grid: 'geodat<looks>.geojson' (preferred) or 'geodat<looks>.in' in the same
+    directory, or None if f is not a .pow or no such geodat exists. The
+    '<looks>' token (e.g. '10x2') is the filename field just before '.pow',
+    matching the s1setup convention (cloneSLCdir.py: 'P<dir>.10x2.pow' beside
+    'geodat10x2.geojson')."""
+    base = os.path.basename(f)
+    if not base.endswith('.pow'):
+        return None
+    stem = base[:-len('.pow')]
+    if '.' not in stem:
+        return None
+    token = stem.rsplit('.', 1)[-1]          # e.g. '10x2'
+    d = os.path.dirname(f)
+    for name in (f'geodat{token}.geojson', f'geodat{token}.in'):
+        cand = os.path.join(d, name)
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def powToGdalMem(f, dType='>f4'):
+    """Read a raw S1 power image (.pow) sized from its shared multilook geodat
+    (geodat<looks>.geojson/.in -- see findPowGeodat) and return a single-band
+    GDAL MEM dataset holding its AMPLITUDE (sqrt of the power, which compresses
+    the dynamic range for display). The .pow carries no header of its own: it is
+    byte-swapped (big-endian) binary, float32 by default (dType), stored
+    azimuth-major (na rows x nr columns). No map geotransform is set -- a .pow is
+    in radar (range/azimuth) geometry, not a projected grid, so --epsg does not
+    apply."""
+    try:
+        from utilities.geodatrxa import geodatrxa
+    except ImportError:
+        sys.exit('showimage: utilities.geodatrxa not available — cannot size .pow files')
+    geodat = findPowGeodat(f)
+    if geodat is None:
+        sys.exit(f'showimage: no geodat<looks>.geojson/.in beside {f!r} to size the .pow')
+    try:
+        gd = geodatrxa(file=geodat)
+    except Exception as exc:
+        sys.exit(f'showimage: cannot read geodat {geodat!r} for {f!r}: {exc}')
+    nr, na = gd.nr, gd.na                     # range (cols), azimuth (rows)
+    if nr <= 0 or na <= 0:
+        sys.exit(f'showimage: geodat {geodat!r} gave invalid size nr={nr} na={na}')
+    arr = np.fromfile(f, dtype=np.dtype(dType))
+    expected = na * nr
+    if arr.size < expected:
+        sys.exit(f'showimage: {f!r} has only {arr.size} samples but geodat {geodat!r} '
+                 f'implies na*nr = {na}*{nr} = {expected} '
+                 '(file too short — wrong multilook geodat or sample type?)')
+    if arr.size > expected:
+        # Some .pow files carry a few extra trailing azimuth rows beyond what the
+        # geodat records; use the geodat's (shorter) na*nr and drop the surplus.
+        extra = arr.size - expected
+        print(f'showimage: {os.path.basename(f)} has {arr.size} samples, {extra} more '
+              f'than geodat na*nr = {na}*{nr} = {expected}; reading the first {expected} '
+              f'({extra / nr:g} extra azimuth row(s) dropped)', file=sys.stderr)
+        arr = arr[:expected]
+    arr = arr.astype(np.float32).reshape(na, nr)
+    # Display amplitude (sqrt of power); clip any negatives (invalid/border
+    # samples, not real power) to 0 so sqrt stays defined.
+    arr = np.sqrt(np.clip(arr, 0.0, None)).astype(np.float32)
+    driver = gdal.GetDriverByName('MEM')
+    mem_ds = driver.Create('', nr, na, 1, gdal.GDT_Float32)
+    band = mem_ds.GetRasterBand(1)
+    band.WriteArray(arr)
+    band.SetNoDataValue(-2e9)
     return mem_ds
 
 
@@ -2715,6 +2793,8 @@ def main():
         try:
             if is_geodat == 'vel':
                 datasets.append(velGeodatToGdalMem(f, epsg=args.epsg))
+            elif is_geodat == 'pow':
+                datasets.append(powToGdalMem(f, dType=geodat_dtype))
             elif is_geodat:
                 datasets.append(geodatToGdalMem(f, dType=geodat_dtype,
                                                 epsg=args.epsg))
@@ -2730,9 +2810,13 @@ def main():
             # A geodat mask is only compared !=0, so its sample type doesn't
             # matter for masking -- but honor --byte/--shortint/--epsg so it
             # reads and georeferences the same way as the image geodat would.
-            mask_ds = (geodatToGdalMem(mask_file, dType=geodat_dtype,
-                                       epsg=args.epsg)
-                       if mask_is_geodat else gdal.Open(mask_file))
+            if mask_is_geodat == 'pow':
+                mask_ds = powToGdalMem(mask_file, dType=geodat_dtype)
+            elif mask_is_geodat:
+                mask_ds = geodatToGdalMem(mask_file, dType=geodat_dtype,
+                                          epsg=args.epsg)
+            else:
+                mask_ds = gdal.Open(mask_file)
         except Exception as e:
             sys.exit(f'Cannot open mask file {mask_file}: {e}')
         mask_arr = mask_ds.GetRasterBand(1).ReadAsArray()
