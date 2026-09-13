@@ -3,6 +3,7 @@ import argparse
 import math
 import os
 import sys
+import time
 import numpy as np
 
 try:
@@ -19,10 +20,61 @@ DPI = 100
 CBAR_PX = 120   # pixels reserved for colorbar panel
 SCROLLBAR_W = 18  # scrollbar widget thickness
 LABEL_H = 22      # per-image title label height
-QUIT_H = 34       # quit button row height
 DECO_H = 95       # WM title bar (~37) + buffer; task bar already excluded by wm maxsize
 CMAPS = ['gray', 'viridis', 'plasma', 'inferno', 'magma', 'hot', 'coolwarm',
          'RdBu', 'seismic', 'bwr', 'jet', 'rainbow', 'turbo', 'hsv']
+#
+# Preferred UI fonts, best first.  Tk's stock TkDefaultFont here is 9pt
+# 'nimbus sans l', which is cramped and hard to read on a button; the first of
+# these the running Tk can actually resolve is used instead.  A Tk built
+# without Xft only offers the core X families (Lucida among them), so the list
+# runs from the TrueType faces a modern desktop has down to those.
+#
+UIFONTS = ['DejaVu Sans', 'Lucida Grande', 'Helvetica Neue', 'Lucida',
+           'Helvetica']
+MONOFONTS = ['DejaVu Sans Mono', 'Menlo', 'Lucidatypewriter', 'Courier']
+UIFONTSIZE = 10
+#
+# Widget theme used when the display is an expensive one to talk to.  It must
+# be one Tk ships with (clam, default, alt, classic): the modern themes come
+# from the optional ttkthemes package, whose ThemedStyle loads every theme and
+# its images before any name is chosen -- ~25x a plain ttk.Style locally, and
+# seconds over a forwarded X connection, where cost is driven by round trips
+# rather than bytes.  'clam' is the cheapest of the built-ins as well as the
+# best looking -- ~18 ms to set up plus 50 widgets, against ~21 ms for
+# 'default' and ~72 ms for 'classic' and 'alt'.  That gap is trivial locally
+# but is multiplied along with everything else on a slow display, which is the
+# only place this theme is ever used.
+#
+DEFAULTTHEME = 'clam'
+#
+# Used when neither the requested theme nor DEFAULTTHEME can be had.  Always
+# present and always cheap, so it is the same 'clam' by default.
+#
+FALLBACKTHEME = 'clam'
+#
+# Theme used when the display turns out to be a cheap one to talk to.  See
+# chooseTheme(): the default '--theme auto' takes this when it is affordable
+# and DEFAULTTHEME when it is not.  Any ttkthemes name works here; the cost is
+# in loading ttkthemes at all, not in which of its themes is chosen.
+#
+LOCALTHEME = 'scidblue'
+#
+# A display counts as expensive when one X round trip costs more than this.
+# Local displays -- unix socket, or TCP to this same machine -- measure around
+# 0.05 ms; ssh X11 forwarding is orders of magnitude worse.  What makes the
+# modern themes costly is the number of round trips they need, not the bytes
+# they move, so round-trip time is the thing worth measuring.  The gap between
+# the two cases is wide enough that the exact threshold hardly matters.
+#
+REMOTEROUNDTRIP = 0.5e-3
+#
+# Style for the on/off buttons (the click modes and the Show toggles).  It is
+# a Toolbutton wearing an ordinary button's layout: the flat modern themes draw
+# a bare Toolbutton with no border at all, which makes an unpressed toggle read
+# as a label.  See styleToggles().
+#
+TOGGLESTYLE = 'Toggle.Toolbutton'
 
 
 def getScreenSize():
@@ -272,7 +324,11 @@ def openNisarH5(filepath, frequency='frequencyA', pol=None):
             if fname in intf_grp:
                 _register(fname, intf_grp[fname], is_phase=is_phase)
 
-    elif product == 'ROFF':
+    elif product in ('ROFF', 'GOFF'):
+        #
+        # Geocoded (GOFF) and range/azimuth (ROFF) offsets carry the same
+        # per-layer fields, so they register identically
+        #
         off_grp = freq_grp['pixelOffsets'][available_pol]
         layers = sorted(k for k in off_grp.keys() if k.startswith('layer'))
         layer_fields = ['slantRangeOffset', 'alongTrackOffset', 'correlationSurfacePeak',
@@ -298,17 +354,6 @@ def openNisarH5(filepath, frequency='frequencyA', pol=None):
         for fname, is_phase in field_is_phase.items():
             if fname in intf_grp:
                 _register(fname, intf_grp[fname], is_phase=is_phase)
-
-    elif product == 'GOFF':
-        off_grp = freq_grp['pixelOffsets'][available_pol]
-        layers = sorted(k for k in off_grp.keys() if k.startswith('layer'))
-        layer_fields = ['slantRangeOffset', 'alongTrackOffset', 'correlationSurfacePeak',
-                        'snr', 'slantRangeOffsetVariance', 'alongTrackOffsetVariance',
-                        'crossOffsetVariance']
-        for layer in layers:
-            for fname in layer_fields:
-                if fname in off_grp[layer]:
-                    _register(f'{layer}/{fname}', off_grp[layer][fname])
 
     elif product == 'GCOV':
         cov_terms = []
@@ -508,15 +553,17 @@ def buildGpkgColors(values, is_numeric, cmap_name='viridis', vmin=None, vmax=Non
             vmax = float(np.nanmax(finite)) if finite.size else 1.0
         if vmin == vmax:
             vmax = vmin + 1.0
+        #
+        # Mapped in one vectorized call rather than per feature: a QC layer can
+        # carry tens of thousands of points, and this runs again on every
+        # field switch and every Apply in the Legend window
+        #
         norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
-        cmap = mcm.get_cmap(cmap_name)
-        colors = []
-        for v in arr:
-            if not np.isfinite(v):
-                colors.append(GRAY)
-            else:
-                r, gg, b, _ = cmap(norm(v))
-                colors.append('#%02x%02x%02x' % (int(r * 255), int(gg * 255), int(b * 255)))
+        finite_mask = np.isfinite(arr)
+        rgb = (mcm.get_cmap(cmap_name)(norm(np.where(finite_mask, arr, vmin)))
+               [:, :3] * 255).astype(np.uint8)
+        colors = [GRAY if not ok else '#%02x%02x%02x' % tuple(row)
+                  for ok, row in zip(finite_mask, rgb)]
         legend = {'kind': 'numeric', 'cmap': cmap_name, 'vmin': vmin, 'vmax': vmax}
         return colors, legend
 
@@ -538,6 +585,20 @@ def buildGpkgColors(values, is_numeric, cmap_name='viridis', vmin=None, vmax=Non
     legend = {'kind': 'categorical',
              'entries': [(c if c else '(none)', cat_color[c]) for c in cats]}
     return colors, legend
+
+
+def indexLike(coords):
+    """True if coords say nothing a pixel index does not already say.
+
+    A file with no georeferencing still gets a coordinate array out of GDAL's
+    default 1-per-pixel geotransform -- a raw .pow, in radar geometry, is the
+    usual case -- and plotting against that is just the pixel index under
+    another name.  Used to decide whether the Coords axis is worth offering.
+    """
+    if coords is None or len(coords) < 2:
+        return True
+    steps = np.diff(np.asarray(coords, dtype=float))
+    return bool(abs(coords[0]) < 1e-9 and np.allclose(np.abs(steps), 1.0))
 
 
 def worldToPixel(x, y, gt, factor=1):
@@ -800,21 +861,20 @@ def openProfileWindow(dist, vals_or_list, p0, p1, titles=None, parent=None, pos=
             ymin_vp.set(f'{lo:.4g}')
             ymax_vp.set(f'{hi:.4g}')
 
-    lbtn_ref = [None]
+    log_var_p = tk.BooleanVar(value=False)
 
     def _toggle_prof_log():
-        log_y_p[0] = not log_y_p[0]
+        log_y_p[0] = log_var_p.get()
         scale = 'log' if log_y_p[0] else 'linear'
-        lbtn_ref[0].config(text='Log Y ✓' if log_y_p[0] else 'Log Y')
         for ax in prof_axes:
             ax.set_yscale(scale)
         mpl_ref[0].draw_idle()
 
     ttk.Button(ctrl_frame, text='Apply', command=_apply_prof_y).pack(side='left', padx=2)
     ttk.Button(ctrl_frame, text='Auto', command=_auto_prof_y).pack(side='left', padx=2)
-    lbtn = ttk.Button(ctrl_frame, text='Log Y', command=_toggle_prof_log)
-    lbtn.pack(side='left', padx=2)
-    lbtn_ref[0] = lbtn
+    ttk.Checkbutton(ctrl_frame, text='Log Y', variable=log_var_p,
+                    style=TOGGLESTYLE,
+                    command=_toggle_prof_log).pack(side='left', padx=2)
 
     mpl = FigureCanvasTkAgg(fig, master=win)
     mpl.draw()
@@ -823,36 +883,7 @@ def openProfileWindow(dist, vals_or_list, p0, p1, titles=None, parent=None, pos=
 
 
 # -----------------------------------------------------------------------
-# Non-scroll path: single matplotlib figure with embedded colorbar
-# -----------------------------------------------------------------------
-
-def makeFigure(dec, title, cmap, vmin, vmax, is_rgb):
-    """Build a matplotlib Figure sized exactly to the image in pixels."""
-    import matplotlib.figure as mfig
-
-    ny, nx = dec.shape[:2]
-    fig_w_px = nx if is_rgb else nx + CBAR_PX
-    fig = mfig.Figure(figsize=(fig_w_px / DPI, ny / DPI), dpi=DPI)
-
-    if is_rgb:
-        ax = fig.add_axes([0, 0, 1, 1])
-        ax.imshow(dec, interpolation='nearest', aspect='equal')
-    else:
-        cbar_frac = CBAR_PX / fig_w_px
-        ax_right = 1 - cbar_frac - 0.02
-        ax = fig.add_axes([0, 0, ax_right, 1])
-        cax = fig.add_axes([ax_right + 0.03, 0.05, 0.04, 0.9])
-        im = ax.imshow(dec, cmap=cmap, vmin=vmin, vmax=vmax,
-                       interpolation='nearest', aspect='equal')
-        fig.colorbar(im, cax=cax)
-
-    ax.set_title(title, fontsize=8)
-    ax.axis('off')
-    return fig, fig_w_px, ny
-
-
-# -----------------------------------------------------------------------
-# Scroll path: PhotoImage for fast panning + separate colorbar figure
+# PhotoImage for fast panning + separate colorbar figure
 # -----------------------------------------------------------------------
 
 def decToPhoto(dec, cmap, vmin, vmax, is_rgb):
@@ -871,56 +902,177 @@ def decToPhoto(dec, cmap, vmin, vmax, is_rgb):
     return ImageTk.PhotoImage(Image.fromarray(arr))
 
 
-def makeColorbarFig(cmap, vmin, vmax, height_px):
-    """Standalone colorbar figure for the scroll layout."""
-    import matplotlib.figure as mfig
+def measureRoundTrip(root, n=25):
+    """Seconds per X round trip on `root`'s display.
+
+    winfo_pointerx() is XQueryPointer, which the server must answer, so each
+    call is a full client->server->client hop rather than something the client
+    can buffer.  The whole probe costs ~1.5 ms on a local display, cheap enough
+    to run at every startup.
+    """
+    root.winfo_pointerx()               # connect and warm up; not timed
+    start = time.time()
+    for _ in range(n):
+        root.winfo_pointerx()
+    return (time.time() - start) / n
+
+
+def chooseTheme(root):
+    """Pick a theme from what this display's round trips actually cost.
+
+    $DISPLAY cannot answer this: ssh forwarding presents as 'localhost:13.0'
+    and a fast local TCP connection as 'localhost:4.0', which are the same
+    string shape but differ by orders of magnitude.  Measuring separates them.
+
+    ttkthemes is checked by spec rather than imported, so that a machine
+    without it quietly gets DEFAULTTHEME instead of the 'not available' warning
+    a name the user never typed would otherwise produce.
+    """
+    import importlib.util
+
+    if measureRoundTrip(root) >= REMOTEROUNDTRIP:
+        return DEFAULTTHEME
+    if importlib.util.find_spec('ttkthemes') is None:
+        return DEFAULTTHEME
+    return LOCALTHEME
+
+
+def applyTheme(root, wanted):
+    """Put the widgets under `wanted`, falling back where it is unavailable.
+
+    `wanted` may be 'auto' (or None) to let chooseTheme() decide from what the
+    display costs to talk to.
+
+    ttkthemes carries the modern themes ('arc' and friends) and is optional:
+    without it, or with a name neither it nor Tk knows, this drops to the best
+    built-in theme rather than failing -- the viewer is the point, not its
+    styling. Returns the ttk.Style actually in force, which the caller styles
+    the toggle buttons on top of."""
+    from tkinter import ttk
+
+    if wanted in (None, 'auto'):
+        wanted = chooseTheme(root)
+
+    #
+    # ThemedStyle's constructor loads every ttkthemes theme, images and all.
+    # That costs ~25x a plain ttk.Style locally and seconds over a proxied X
+    # connection, and it used to be paid even when the caller asked for a
+    # built-in theme, since `wanted` was only consulted afterwards -- which
+    # made '--theme clam' cost exactly as much as the arc it was meant to
+    # avoid.  A built-in needs none of that machinery, so only reach for
+    # ttkthemes when Tk itself cannot supply the theme.
+    #
+    style = ttk.Style(root)
+    if wanted in set(style.theme_names()):
+        style.theme_use(wanted)
+        return style
+
+    try:
+        from ttkthemes import ThemedStyle
+        style = ThemedStyle(root)
+    except ImportError:
+        pass
+    available = set(style.theme_names())
+    for name in (wanted, DEFAULTTHEME, FALLBACKTHEME):
+        if name in available:
+            style.set_theme(name) if hasattr(style, 'set_theme') else \
+                style.theme_use(name)
+            if name != wanted:
+                print(f'showimage: theme {wanted!r} not available '
+                      f'(pip install ttkthemes for the modern set) -- '
+                      f'using {name!r}', file=sys.stderr)
+            return style
+    return style
+
+
+def styleToggles(style):
+    """Define TOGGLESTYLE on top of whichever theme is in force.
+
+    Two things every theme gets wrong for an on/off button. It draws a
+    Toolbutton with no border until the pointer is over it, so an unpressed
+    toggle reads as a label -- fixed by giving it an ordinary button's layout.
+    And it makes the selected state too quiet to spot at a glance -- fixed by
+    tinting it, which is what tells the eye which mode is live. Both are
+    applied after the theme, since setting a theme resets the style database.
+    """
+    import tkinter as tk
+
+    try:
+        style.layout(TOGGLESTYLE, style.layout('TButton'))
+    except tk.TclError:
+        #
+        # No TButton layout to borrow: the plain Toolbutton this falls back to
+        # still works, it just draws flat until hovered
+        #
+        pass
+    style.configure(TOGGLESTYLE, relief='raised', borderwidth=1, padding=3,
+                    anchor='center')
+    style.map(TOGGLESTYLE,
+              relief=[('selected', 'sunken'), ('pressed', 'sunken')],
+              background=[('selected', '#9fc5e8'), ('active', '#dfe6ec')],
+              foreground=[('selected', 'black')])
+
+
+def configureFonts(root):
+    """Point the stock Tk fonts at a more legible family and size, and return
+    the (family, size) to use where values are read in columns."""
+    from tkinter import font as tkfont
+
+    available = {f.lower() for f in tkfont.families(root)}
+
+    def pick(preferred):
+        for family in preferred:
+            if family.lower() in available:
+                return family
+        return None
+
+    ui = pick(UIFONTS)
+    for name in ('TkDefaultFont', 'TkTextFont', 'TkMenuFont', 'TkHeadingFont'):
+        stock = tkfont.nametofont(name)
+        stock.configure(size=UIFONTSIZE)
+        if ui is not None:
+            stock.configure(family=ui)
+    mono = pick(MONOFONTS)
+    return (mono or ui or 'courier', UIFONTSIZE - 1)
+
+
+def _drawColorbar(fig, cmap, vmin, vmax):
+    """Draw a colorbar filling fig. Shared by the initial build and every
+    redraw, so a rescale/recolor produces exactly the bar the first one did."""
     import matplotlib.cm as mcm
     import matplotlib.colors as mcolors
 
-    fig = mfig.Figure(figsize=(CBAR_PX / DPI, height_px / DPI), dpi=DPI)
     cax = fig.add_axes([0.25, 0.05, 0.35, 0.9])
     sm = mcm.ScalarMappable(cmap=mcm.get_cmap(cmap),
                              norm=mcolors.Normalize(vmin=vmin, vmax=vmax))
     sm.set_array([])
     fig.colorbar(sm, cax=cax)
+
+
+def makeColorbarFig(cmap, vmin, vmax, height_px):
+    """Standalone colorbar figure for one pane."""
+    import matplotlib.figure as mfig
+
+    fig = mfig.Figure(figsize=(CBAR_PX / DPI, height_px / DPI), dpi=DPI)
+    _drawColorbar(fig, cmap, vmin, vmax)
     return fig
 
 
 def _rebuildColorbar(ref, cmap, vmin, vmax):
     """Redraw a pane's standalone colorbar figure in place after a rescale/recolor."""
-    import matplotlib.cm as mcm
-    import matplotlib.colors as mcolors
-
     if ref['cbar_fig'] is None:
         return
     ref['cbar_fig'].clear()
-    cax = ref['cbar_fig'].add_axes([0.25, 0.05, 0.35, 0.9])
-    sm = mcm.ScalarMappable(cmap=mcm.get_cmap(cmap),
-                             norm=mcolors.Normalize(vmin=vmin, vmax=vmax))
-    sm.set_array([])
-    ref['cbar_fig'].colorbar(sm, cax=cax)
+    _drawColorbar(ref['cbar_fig'], cmap, vmin, vmax)
     ref['cbar_cv'].draw()
-
-
-def bindScroll(tk_canvas):
-    """Bind mouse-wheel scroll for Windows/Mac and Linux."""
-    def _y(event):
-        tk_canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
-    def _x(event):
-        tk_canvas.xview_scroll(int(-1 * (event.delta / 120)), 'units')
-    tk_canvas.bind('<MouseWheel>', _y)
-    tk_canvas.bind('<Shift-MouseWheel>', _x)
-    tk_canvas.bind('<Button-4>', lambda e: tk_canvas.yview_scroll(-1, 'units'))
-    tk_canvas.bind('<Button-5>', lambda e: tk_canvas.yview_scroll(1, 'units'))
-    tk_canvas.bind('<Shift-Button-4>', lambda e: tk_canvas.xview_scroll(-1, 'units'))
-    tk_canvas.bind('<Shift-Button-5>', lambda e: tk_canvas.xview_scroll(1, 'units'))
 
 
 # -----------------------------------------------------------------------
 # Main display
 # -----------------------------------------------------------------------
 
-def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=None):
+def showImage(image_defs, sw, sh, switch_infos=None, rtl=False,
+              gpkg_overlay=None, theme='auto'):
     """Display 1–3 images side by side with a floating control palette.
 
     image_defs: list of dicts, each with keys:
@@ -930,6 +1082,7 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=Non
         with the image and plot/profile windows opening to its left
         (mirror of the default left-to-right layout) — lets a second
         instance be run without overlapping the first.
+    theme: ttk theme name (see applyTheme).
     gpkg_overlay: optional dict from main() (geom_type, geoms, colors, legend,
         attribute, point_radius, fill_polygons) -- drawn on every pane that has its
         own 'geotransform'/'dec_factor' (see readGpkgOverlay()/buildGpkgColors()).
@@ -949,6 +1102,9 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=Non
     root = tk.Tk()
     root.title(' | '.join(f'{i+1}) {os.path.basename(d["title"])}'
                           for i, d in enumerate(image_defs)))
+    style = applyTheme(root, theme)
+    monoFont = configureFonts(root)
+    styleToggles(style)
 
     # ---- command palette (separate floating window) ----
     palette = tk.Toplevel(root)
@@ -961,8 +1117,11 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=Non
     col_active          = [False]
     row_active          = [False]
     lines_visible       = [True]
-    coords_active       = [any(d.get('col_coords') is not None for d in image_defs)]
+    points_visible      = [True]
+    coords_active       = [any(not indexLike(d.get('col_coords'))
+                               for d in image_defs)]
     overlay_set_visible = [None]
+    points_set_visible  = [None]
     gpkg_overlay_items = []  # (canvas, item) pairs; populated once panes exist, below
     all_same_size = all(d['dec'].shape == image_defs[0]['dec'].shape for d in image_defs)
     scroll_synced = [all_same_size]  # default: synced iff all same size
@@ -975,72 +1134,125 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=Non
                 'bias_vars': [], 'remove_mean': [False], 'history': []},
     }
 
-    btn_col = ttk.Frame(palette)
-    btn_col.pack(side='top', fill='x', padx=4, pady=(4, 2))
+    #
+    # The palette is grouped rather than one long column of identical buttons:
+    # the four click modes are mutually exclusive (radio), the toggles are
+    # on/off (check), and both use the Toolbutton style so their state shows as
+    # a pressed button -- the old '✓'/'✗'/'●' suffixes were text, and the Tk
+    # default font has no glyph for them, so they drew as empty boxes.
+    #
+    def _grid2(parent, widgets):
+        """Lay widgets out two to a row, filling the frame evenly"""
+        parent.columnconfigure((0, 1), weight=1, uniform='half')
+        for i, widget in enumerate(widgets):
+            widget.grid(row=i // 2, column=i % 2, sticky='ew', padx=1, pady=1)
 
-    pick_btn    = ttk.Button(btn_col, text='Pick')
-    profile_btn = ttk.Button(btn_col, text='Profile')
-    col_btn     = ttk.Button(btn_col, text='Col Plot')
-    row_btn     = ttk.Button(btn_col, text='Row Plot')
-    lines_btn   = ttk.Button(btn_col, text='Lines ✓')
-    coords_btn  = ttk.Button(btn_col, text='Coords ✓' if coords_active[0] else 'Coords')
-    quit_btn    = ttk.Button(btn_col, text='Quit', command=root.destroy)
-    core_btns = [pick_btn, profile_btn, col_btn, row_btn, lines_btn, coords_btn]
+    body = ttk.Frame(palette)
+    body.pack(side='top', fill='x', padx=4, pady=(4, 2))
+
+    mode_var = tk.StringVar(value='')
+    mode_box = ttk.Labelframe(body, text='Mode')
+    mode_box.pack(fill='x', pady=(0, 4))
+    pick_btn = ttk.Radiobutton(mode_box, text='Pick', value='pick',
+                               variable=mode_var, style=TOGGLESTYLE)
+    profile_btn = ttk.Radiobutton(mode_box, text='Profile', value='profile',
+                                  variable=mode_var, style=TOGGLESTYLE)
+    col_btn = ttk.Radiobutton(mode_box, text='Col Plot', value='col',
+                              variable=mode_var, style=TOGGLESTYLE)
+    row_btn = ttk.Radiobutton(mode_box, text='Row Plot', value='row',
+                              variable=mode_var, style=TOGGLESTYLE)
+    _grid2(mode_box, [pick_btn, profile_btn, col_btn, row_btn])
+
+    show_box = ttk.Labelframe(body, text='Show')
+    show_box.pack(fill='x', pady=(0, 4))
+    lines_var = tk.BooleanVar(value=True)
+    points_var = tk.BooleanVar(value=True)
+    lines_btn = ttk.Checkbutton(show_box, text='Lines', variable=lines_var,
+                                style=TOGGLESTYLE)
+    points_btn = ttk.Checkbutton(show_box, text='Points', variable=points_var,
+                                 style=TOGGLESTYLE)
+    toggles = [lines_btn, points_btn]
+
     gpkg_visible = [True]
+    gpkg_var = tk.BooleanVar(value=True)
     if gpkg_overlay is not None:
-        gpkg_btn = ttk.Button(btn_col, text='GPKG ✓')
-        core_btns.append(gpkg_btn)
+        gpkg_btn = ttk.Checkbutton(show_box, text='GPKG', variable=gpkg_var,
+                                   style=TOGGLESTYLE)
+        toggles.append(gpkg_btn)
     else:
         gpkg_btn = None
     # Masks (a file's own embedded VRT mask band and/or an external --mask file,
     # combined via combineMasks()) are honored by default; button only shown if at
     # least one currently-loaded pane/band actually has one.
+    # InvMask flips the effective combined mask's sense, whatever its source(s).
+    # Same visibility condition, since anywhere there's a mask to toggle on/off,
+    # there's one worth inverting.
     mask_applied_state = [True]
-    if any(d.get('embedded_mask') is not None for d in image_defs):
-        mask_btn = ttk.Button(btn_col, text='Mask ✓')
-        core_btns.append(mask_btn)
-    else:
-        mask_btn = None
-    # InvMask flips the effective combined mask's sense, whatever its source(s) --
-    # embedded VRT mask band and/or --mask. Same visibility condition as Mask,
-    # since anywhere there's a mask to toggle on/off, there's one worth inverting.
     mask_inverted_state = [False]
+    mask_var = tk.BooleanVar(value=True)
+    invmask_var = tk.BooleanVar(value=False)
     if any(d.get('embedded_mask') is not None for d in image_defs):
-        invmask_btn = ttk.Button(btn_col, text='InvMask ✗')
-        core_btns.append(invmask_btn)
+        mask_btn = ttk.Checkbutton(show_box, text='Mask', variable=mask_var,
+                                   style=TOGGLESTYLE)
+        invmask_btn = ttk.Checkbutton(show_box, text='InvMask',
+                                      variable=invmask_var, style=TOGGLESTYLE)
+        toggles += [mask_btn, invmask_btn]
     else:
-        invmask_btn = None
+        mask_btn = invmask_btn = None
+    sync_var = tk.BooleanVar(value=scroll_synced[0])
     if n_imgs > 1:
-        sync_btn = ttk.Button(btn_col,
-                              text='Sync ✓' if scroll_synced[0] else 'Sync')
-        core_btns.append(sync_btn)
+        sync_btn = ttk.Checkbutton(show_box, text='Sync', variable=sync_var,
+                                   style=TOGGLESTYLE)
+        toggles.append(sync_btn)
     else:
         sync_btn = None
-    core_btns.append(quit_btn)
-    for btn in core_btns:
-        btn.pack(side='top', fill='x', pady=2, padx=2)
+    _grid2(show_box, toggles)
 
-    ttk.Separator(btn_col, orient='horizontal').pack(fill='x', pady=(4, 2))
-    ttk.Label(btn_col, text='Colormap:', anchor='w').pack(fill='x', padx=2)
+    disp_box = ttk.Labelframe(body, text='Display')
+    disp_box.pack(fill='x', pady=(0, 4))
+    #
+    # What the Col/Row/Profile plots put on the x axis.  A pair of radios
+    # rather than the old single 'Coords' toggle: with one button there was
+    # nothing to say what the other state was, and on an image carrying no
+    # coordinates it silently did nothing.  Here the choice is named, and
+    # Coords is simply disabled when the images have none to plot against.
+    #
+    haveCoords = any(not indexLike(d.get('col_coords')) or
+                     not indexLike(d.get('row_coords')) for d in image_defs)
+    _ax_row = ttk.Frame(disp_box)
+    _ax_row.pack(fill='x', padx=2, pady=(2, 1))
+    ttk.Label(_ax_row, text='Plot x').pack(side='left')
+    axis_var = tk.StringVar(value='coords' if coords_active[0] else 'pixels')
+    pixels_btn = ttk.Radiobutton(_ax_row, text='Pixels', value='pixels',
+                                 variable=axis_var, style=TOGGLESTYLE)
+    coords_btn = ttk.Radiobutton(_ax_row, text='Coords', value='coords',
+                                 variable=axis_var, style=TOGGLESTYLE)
+    pixels_btn.pack(side='left', fill='x', expand=True, padx=(4, 1))
+    coords_btn.pack(side='left', fill='x', expand=True)
+    if not haveCoords:
+        coords_btn.state(['disabled'])
+
+    _cmap_row = ttk.Frame(disp_box)
+    _cmap_row.pack(fill='x', padx=2, pady=(2, 1))
+    ttk.Label(_cmap_row, text='Colormap').pack(side='left')
     cmap_var = tk.StringVar(value=image_defs[0].get('cmap', 'gray'))
-    cmap_combo = ttk.Combobox(btn_col, textvariable=cmap_var, values=CMAPS,
-                               state='readonly', width=12)
-    cmap_combo.pack(side='top', fill='x', pady=2, padx=2)
+    cmap_combo = ttk.Combobox(_cmap_row, textvariable=cmap_var, values=CMAPS,
+                               state='readonly', width=10)
+    cmap_combo.pack(side='right', fill='x', expand=True, padx=(4, 0))
 
-    ttk.Separator(btn_col, orient='horizontal').pack(fill='x', pady=(4, 2))
     mod_entries = []
     for _mi, _idef in enumerate(image_defs):
         if _idef['is_rgb']:
             mod_entries.append(None)
             continue
-        _row_f = ttk.Frame(btn_col)
-        _row_f.pack(fill='x', pady=1, padx=2)
-        _lbl = f'P{_mi+1} mod:' if n_imgs > 1 else 'Mod:'
-        ttk.Label(_row_f, text=_lbl, anchor='w').pack(side='left')
+        _row_f = ttk.Frame(disp_box)
+        _row_f.pack(fill='x', padx=2, pady=1)
+        _lbl = f'Mod P{_mi+1}' if n_imgs > 1 else 'Mod'
+        ttk.Label(_row_f, text=_lbl).pack(side='left')
         _mv = _idef.get('mod_val')
         _var = tk.StringVar(value='' if _mv is None else str(_mv))
         _ent = ttk.Entry(_row_f, textvariable=_var, width=8)
-        _ent.pack(side='left', fill='x', expand=True)
+        _ent.pack(side='right', fill='x', expand=True, padx=(4, 0))
         mod_entries.append((_var, _ent))
 
     n_non_rgb = sum(1 for d in image_defs if not d['is_rgb'])
@@ -1048,20 +1260,33 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=Non
     common_vmax_var = tk.StringVar(value='')
     common_scale_btn = None
     if n_non_rgb > 1:
-        ttk.Separator(btn_col, orient='horizontal').pack(fill='x', pady=(4, 2))
-        ttk.Label(btn_col, text='Common scale (min/max):', anchor='w').pack(fill='x', padx=2)
-        _cs_row = ttk.Frame(btn_col)
-        _cs_row.pack(fill='x', pady=1, padx=2)
-        _cs_min_ent = ttk.Entry(_cs_row, textvariable=common_vmin_var, width=6)
-        _cs_min_ent.pack(side='left', fill='x', expand=True, padx=(0, 2))
-        _cs_max_ent = ttk.Entry(_cs_row, textvariable=common_vmax_var, width=6)
+        _cs_row = ttk.Frame(disp_box)
+        _cs_row.pack(fill='x', padx=2, pady=(3, 1))
+        ttk.Label(_cs_row, text='Scale').pack(side='left')
+        _cs_min_ent = ttk.Entry(_cs_row, textvariable=common_vmin_var, width=5)
+        _cs_min_ent.pack(side='left', fill='x', expand=True, padx=(4, 2))
+        _cs_max_ent = ttk.Entry(_cs_row, textvariable=common_vmax_var, width=5)
         _cs_max_ent.pack(side='left', fill='x', expand=True)
-        common_scale_btn = ttk.Button(btn_col, text='Common Scale')
-        common_scale_btn.pack(side='top', fill='x', pady=2, padx=2)
+        common_scale_btn = ttk.Button(disp_box, text='Common Scale')
+        common_scale_btn.pack(fill='x', padx=2, pady=(1, 3))
 
+    band_box = ttk.Labelframe(body, text='Bands')
+
+    #
+    # Status last but one, Quit alone at the bottom: it is the one irreversible
+    # control, and it used to sit in the middle of the button stack
+    #
+    quit_btn = ttk.Button(palette, text='Quit', command=root.destroy)
+    quit_btn.pack(side='bottom', fill='x', padx=6, pady=(2, 6))
     status_var = tk.StringVar(value='Ready')
-    status_lbl = ttk.Label(palette, textvariable=status_var, anchor='nw', wraplength=130)
-    status_lbl.pack(side='bottom', fill='both', expand=True, padx=6, pady=(0, 4))
+    #
+    # Monospaced, because most of what lands here is a column of readings
+    # (col/row/val per pane) that only lines up in a fixed-width face
+    #
+    status_lbl = ttk.Label(palette, textvariable=status_var, anchor='nw',
+                           wraplength=130, relief='sunken', padding=4,
+                           font=monoFont)
+    status_lbl.pack(side='bottom', fill='both', expand=True, padx=6, pady=(0, 2))
 
     def _grow_palette_for_status():
         """Grow (never shrink) the palette window when the status text needs
@@ -1092,81 +1317,70 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=Non
     status_var.trace_add('write', _on_status_write)
 
     def deactivate_all():
+        """Leave every click mode. The radio variable carries which one is on,
+        so the buttons show it without any label rewriting."""
         pick_active[0] = False
         profile_active[0] = False
         col_active[0] = False
         row_active[0] = False
-        pick_btn.config(text='Pick')
-        profile_btn.config(text='Profile')
-        col_btn.config(text='Col Plot')
-        row_btn.config(text='Row Plot')
+        mode_var.set('')
 
-    def toggle_pick():
-        if pick_active[0]:
-            deactivate_all()
-        else:
-            deactivate_all()
-            pick_active[0] = True
-            pick_btn.config(text='Pick ●')
-            profile_pts.clear()
-    pick_btn.config(command=toggle_pick)
+    def select_mode():
+        """One handler for all four modes: the radio has already set mode_var,
+        and clicking the mode already selected turns it off again."""
+        wanted = mode_var.get()
+        active = {'pick': pick_active, 'profile': profile_active,
+                  'col': col_active, 'row': row_active}
+        was_on = active[wanted][0] if wanted in active else False
+        deactivate_all()
+        if was_on or not wanted:
+            return
+        active[wanted][0] = True
+        profile_pts.clear()
+        mode_var.set(wanted)
+        if wanted == 'pick':
+            #
+            # A fresh picking session starts with a clean image, the same way
+            # a fresh profile clears the last one
+            #
+            clear_pick_overlay()
+        hint = {'profile': '  Profile: click first point',
+                'col': '  Col Plot: click a pixel to plot that column',
+                'row': '  Row Plot: click a pixel to plot that row'}.get(wanted)
+        if hint:
+            status_var.set(hint)
 
-    def toggle_profile():
-        if profile_active[0]:
-            deactivate_all()
-        else:
-            deactivate_all()
-            profile_active[0] = True
-            profile_btn.config(text='Profile ●')
-            profile_pts.clear()
-            status_var.set('  Profile: click first point')
-    profile_btn.config(command=toggle_profile)
-
-    def toggle_col():
-        if col_active[0]:
-            deactivate_all()
-        else:
-            deactivate_all()
-            col_active[0] = True
-            col_btn.config(text='Col Plot ●')
-            status_var.set('  Col Plot: click a pixel to plot that column')
-    col_btn.config(command=toggle_col)
-
-    def toggle_row():
-        if row_active[0]:
-            deactivate_all()
-        else:
-            deactivate_all()
-            row_active[0] = True
-            row_btn.config(text='Row Plot ●')
-            status_var.set('  Row Plot: click a pixel to plot that row')
-    row_btn.config(command=toggle_row)
+    for _btn in (pick_btn, profile_btn, col_btn, row_btn):
+        _btn.config(command=select_mode)
 
     def toggle_lines():
-        lines_visible[0] = not lines_visible[0]
-        lines_btn.config(text='Lines ✓' if lines_visible[0] else 'Lines ✗')
+        lines_visible[0] = lines_var.get()
         if overlay_set_visible[0]:
             overlay_set_visible[0](lines_visible[0])
     lines_btn.config(command=toggle_lines)
 
+    def toggle_points():
+        points_visible[0] = points_var.get()
+        if points_set_visible[0]:
+            points_set_visible[0](points_visible[0])
+    points_btn.config(command=toggle_points)
+
     if gpkg_btn is not None:
         def toggle_gpkg():
-            gpkg_visible[0] = not gpkg_visible[0]
-            gpkg_btn.config(text='GPKG ✓' if gpkg_visible[0] else 'GPKG ✗')
+            gpkg_visible[0] = gpkg_var.get()
             vis = 'normal' if gpkg_visible[0] else 'hidden'
             for canvas, item in gpkg_overlay_items:
                 canvas.itemconfigure(item, state=vis)
         gpkg_btn.config(command=toggle_gpkg)
 
-    def toggle_coords_palette():
-        coords_active[0] = not coords_active[0]
-        coords_btn.config(text='Coords ✓' if coords_active[0] else 'Coords')
-    coords_btn.config(command=toggle_coords_palette)
+    def choose_plot_axis():
+        coords_active[0] = axis_var.get() == 'coords'
+    pixels_btn.config(command=choose_plot_axis)
+    coords_btn.config(command=choose_plot_axis)
 
     if sync_btn is not None:
         def toggle_sync():
-            scroll_synced[0] = not scroll_synced[0]
-            sync_btn.config(text='Sync ✓' if scroll_synced[0] else 'Sync')
+            scroll_synced[0] = sync_var.get()
         sync_btn.config(command=toggle_sync)
 
     def openOrReuseLineplot(mode):
@@ -1236,13 +1450,13 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=Non
             btn_frame = ttk.Frame(combined_frame)
             btn_frame.grid(row=0, column=0, sticky='ns', padx=(0, 8))
 
-            single_win_btn = ttk.Button(
-                btn_frame, text='Single ✓' if single else 'Single')
+            single_var = tk.BooleanVar(value=single)
+            single_win_btn = ttk.Checkbutton(btn_frame, text='Single',
+                                             variable=single_var,
+                                             style=TOGGLESTYLE)
 
             def toggle_single_win():
-                state['single'] = not state['single']
-                single_win_btn.config(
-                    text='Single ✓' if state['single'] else 'Single')
+                state['single'] = single_var.get()
                 _clear_mode_overlays()
                 new_h = 434 if state['single'] else 234 + 200 * n_imgs
                 state['fig'].set_size_inches(8, max(1.0, (new_h - BTN_H) / DPI))
@@ -1406,12 +1620,11 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=Non
                     xmin_var.set(f'{lo:.4g}')
                     xmax_var.set(f'{hi:.4g}')
 
-            log_btn_ref = [None]
+            log_var = tk.BooleanVar(value=False)
 
             def toggle_log_y():
-                log_y[0] = not log_y[0]
+                log_y[0] = log_var.get()
                 scale = 'log' if log_y[0] else 'linear'
-                log_btn_ref[0].config(text='Log Y ✓' if log_y[0] else 'Log Y')
                 for ax in state['axes']:
                     ax.set_yscale(scale)
                 state['canvas'].draw_idle()
@@ -1422,15 +1635,14 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=Non
                 side='left', padx=2)
             ttk.Button(action_row, text='Auto', command=auto_limits).pack(
                 side='left', padx=2)
-            log_btn = ttk.Button(action_row, text='Log Y', command=toggle_log_y)
-            log_btn.pack(side='left', padx=2)
-            log_btn_ref[0] = log_btn
+            ttk.Checkbutton(action_row, text='Log Y', variable=log_var,
+                            style=TOGGLESTYLE,
+                            command=toggle_log_y).pack(side='left', padx=2)
 
-            rm_btn_ref = [None]
+            rm_var = tk.BooleanVar(value=False)
 
             def toggle_remove_mean():
-                remove_mean[0] = not remove_mean[0]
-                rm_btn_ref[0].config(text='Rm Mean ✓' if remove_mean[0] else 'Rm Mean')
+                remove_mean[0] = rm_var.get()
                 history = list(state.get('history', []))
                 if not history:
                     return
@@ -1450,9 +1662,9 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=Non
                 for idx in history:
                     replay_fn(idx)
 
-            rm_btn = ttk.Button(action_row, text='Rm Mean', command=toggle_remove_mean)
-            rm_btn.pack(side='left', padx=2)
-            rm_btn_ref[0] = rm_btn
+            ttk.Checkbutton(action_row, text='Rm Mean', variable=rm_var,
+                            style=TOGGLESTYLE,
+                            command=toggle_remove_mean).pack(side='left', padx=2)
 
             canvas = FigureCanvasTkAgg(fig, master=win)
             canvas.draw()
@@ -1536,14 +1748,11 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=Non
         use_c = coords_active[0]
         colors = []
         single = state['single']
-        data_row = row
         bad_bias = []
         for i, idef in enumerate(image_defs):
             dec = idef.get('raw', idef['dec'])
             ol = idef.get('origin_lower', False)
             drow = (dec.shape[0] - 1 - row) if ol else row
-            if i == 0:
-                data_row = drow
             if drow >= dec.shape[0]:
                 colors.append(None)
                 continue
@@ -1726,31 +1935,23 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=Non
                           'cbar_fig': cbar_fig_ref, 'cbar_cv': cbar_cv_ref,
                           'title_lbl': title_lbl, 'ny': ny_i, 'nx': nx_i})
 
-    def _wy(event):
-        targets = all_canvases if scroll_synced[0] else [event.widget]
-        for c in targets: c.yview_scroll(int(-1 * (event.delta / 120)), 'units')
-    def _wx(event):
-        targets = all_canvases if scroll_synced[0] else [event.widget]
-        for c in targets: c.xview_scroll(int(-1 * (event.delta / 120)), 'units')
-    def _b4(event):
-        targets = all_canvases if scroll_synced[0] else [event.widget]
-        for c in targets: c.yview_scroll(-1, 'units')
-    def _b5(event):
-        targets = all_canvases if scroll_synced[0] else [event.widget]
-        for c in targets: c.yview_scroll(1, 'units')
-    def _sb4(event):
-        targets = all_canvases if scroll_synced[0] else [event.widget]
-        for c in targets: c.xview_scroll(-1, 'units')
-    def _sb5(event):
-        targets = all_canvases if scroll_synced[0] else [event.widget]
-        for c in targets: c.xview_scroll(1, 'units')
+    def _scroller(axis, amount=None):
+        """Wheel handler scrolling every pane when Sync is on, else the one
+        under the pointer. amount None takes the step from event.delta
+        (Windows/Mac wheels); Linux sends Button-4/5 with a fixed step."""
+        def fn(event):
+            step = amount if amount is not None else int(-1 * (event.delta / 120))
+            for c in (all_canvases if scroll_synced[0] else [event.widget]):
+                (c.yview_scroll if axis == 'y' else c.xview_scroll)(step, 'units')
+        return fn
+
     for c in all_canvases:
-        c.bind('<MouseWheel>',       _wy)
-        c.bind('<Shift-MouseWheel>', _wx)
-        c.bind('<Button-4>',         _b4)
-        c.bind('<Button-5>',         _b5)
-        c.bind('<Shift-Button-4>',   _sb4)
-        c.bind('<Shift-Button-5>',   _sb5)
+        c.bind('<MouseWheel>',       _scroller('y'))
+        c.bind('<Shift-MouseWheel>', _scroller('x'))
+        c.bind('<Button-4>',         _scroller('y', -1))
+        c.bind('<Button-5>',         _scroller('y', 1))
+        c.bind('<Shift-Button-4>',   _scroller('x', -1))
+        c.bind('<Shift-Button-5>',   _scroller('x', 1))
 
     # ---- GeoPackage overlay (drawn once at startup; toggled via the GPKG button) ----
     def draw_gpkg_overlay():
@@ -1863,8 +2064,11 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=Non
         ref['canvas'].image = new_photo
 
     def _refreshDiffPane():
-        """Recompute the diff/sum pane (if any) from the current base arrays of panes 1 and 2."""
-        if len(image_defs) < 3 or not image_defs[-1].get('is_diff'):
+        """Recompute the diff/sum pane (if any) from the current base arrays of
+        panes 1 and 2. Called after anything that changes those two -- a Mask or
+        InvMask toggle, or a band switch."""
+        if (len(image_defs) < 3 or not image_defs[-1].get('is_diff')
+                or len(pane_refs) != len(image_defs)):
             return
         d_idef = image_defs[-1]
         d_ref = pane_refs[-1]
@@ -1883,9 +2087,8 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=Non
         d_ref['title_lbl'].config(text=f'{len(image_defs)}) {d_title}')
 
     def toggle_embedded_mask():
-        mask_applied_state[0] = not mask_applied_state[0]
+        mask_applied_state[0] = mask_var.get()
         apply_it = mask_applied_state[0]
-        mask_btn.config(text='Mask ✓' if apply_it else 'Mask ✗')
         for idef, ref in zip(image_defs, pane_refs):
             if idef.get('embedded_mask') is None:
                 continue
@@ -1897,9 +2100,8 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=Non
         mask_btn.config(command=toggle_embedded_mask)
 
     def toggle_mask_invert():
-        mask_inverted_state[0] = not mask_inverted_state[0]
+        mask_inverted_state[0] = invmask_var.get()
         inverted = mask_inverted_state[0]
-        invmask_btn.config(text='InvMask ✓' if inverted else 'InvMask ✗')
         for idef, ref in zip(image_defs, pane_refs):
             if idef.get('embedded_mask') is None:
                 continue
@@ -1914,14 +2116,20 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=Non
     profile_overlay_items = []
     col_overlay_items     = []   # vertical lines from Col Plot clicks
     row_overlay_items     = []   # horizontal lines from Row Plot clicks
+    pick_overlay_items    = []   # markers left by Pick clicks
 
     def clear_overlay():
         for canvas, item in profile_overlay_items:
             canvas.delete(item)
         profile_overlay_items.clear()
 
-    def _add_canvas_item(canvas, item, lst):
-        if not lines_visible[0]:
+    def clear_pick_overlay():
+        for canvas, item in pick_overlay_items:
+            canvas.delete(item)
+        pick_overlay_items.clear()
+
+    def _add_canvas_item(canvas, item, lst, visible=None):
+        if not (lines_visible[0] if visible is None else visible):
             canvas.itemconfigure(item, state='hidden')
         lst.append((canvas, item))
 
@@ -1931,6 +2139,19 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=Non
             item = canvas.create_oval(col - r, row - r, col + r, row + r,
                                       outline=color, width=2)
             _add_canvas_item(canvas, item, profile_overlay_items)
+
+    def draw_pick_marker(col, row, color='#00e5ff'):
+        """Mark a picked pixel on every pane -- a cross rather than the ring
+        the profile ends use, so the exact pixel stays visible inside it."""
+        r = 6
+        for canvas in all_canvases:
+            for x0, y0, x1, y1 in ((col - r, row, col - 2, row),
+                                   (col + 2, row, col + r, row),
+                                   (col, row - r, col, row - 2),
+                                   (col, row + 2, col, row + r)):
+                item = canvas.create_line(x0, y0, x1, y1, fill=color, width=1)
+                _add_canvas_item(canvas, item, pick_overlay_items,
+                                 visible=points_visible[0])
 
     def draw_profile_line(c0, r0, c1, r1, color='yellow'):
         for canvas in all_canvases:
@@ -1958,6 +2179,12 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=Non
             canvas.itemconfigure(item, state=vis)
     overlay_set_visible[0] = canvas_set_visible
 
+    def pick_set_visible(v):
+        vis = 'normal' if v else 'hidden'
+        for canvas, item in pick_overlay_items:
+            canvas.itemconfigure(item, state=vis)
+    points_set_visible[0] = pick_set_visible
+
     # ---- click handler (bound to all canvases) ----
     def on_canvas_click(event):
         canvas = event.widget
@@ -1966,6 +2193,11 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=Non
 
         if pick_active[0]:
             report_pick(col, row)
+            #
+            # Marked as well as reported, so a run of picks can be seen
+            # against the image; Points hides them again
+            #
+            draw_pick_marker(col, row)
 
         elif profile_active[0]:
             if len(profile_pts) == 0:
@@ -2129,7 +2361,7 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=Non
 
     # ---- band switching (per pane) ----
     if switch_infos is not None and any(si is not None for si in switch_infos):
-        ttk.Separator(btn_col, orient='horizontal').pack(fill='x', pady=(6, 2))
+        band_box.pack(fill='x', pady=(0, 4))
 
         def make_band_switcher(bname, bnum, p_idef, p_ref, p_si, p_idx):
             def switch():
@@ -2187,27 +2419,17 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=Non
                 p_ref['title_lbl'].config(text=f'{p_idx+1}) {bname}')
                 if n_imgs == 1:
                     root.title(f'1) {bname}')
-                # refresh the diff/sum pane if one exists
-                d_idef = image_defs[-1]
-                if d_idef.get('is_diff') and len(pane_refs) == len(image_defs):
-                    d_ref = pane_refs[-1]
-                    d_add = d_idef['add_mode']
-                    d_op = '+' if d_add else '−'
-                    d_arr, d_sc, d_stats = _computeDiffArray(
-                        image_defs[0]['base'], image_defs[1]['base'], d_add)
-                    d_title = f'P1 {d_op} P2    {d_stats}'
-                    d_idef.update({'dec': d_arr, 'base': d_arr,
-                                   'vmin': -d_sc, 'vmax': d_sc, 'title': d_title})
-                    d_photo = decToPhoto(
-                        _disp(d_arr, d_idef.get('origin_lower', False)),
-                        'RdBu', -d_sc, d_sc, False)
-                    d_ref['canvas'].itemconfigure(d_ref['img_item'], image=d_photo)
-                    d_ref['canvas'].image = d_photo
-                    _rebuildColorbar(d_ref, 'RdBu', -d_sc, d_sc)
-                    d_ref['title_lbl'].config(text=f'{len(image_defs)}) {d_title}')
+                _refreshDiffPane()
                 status_var.set(f'Pane {p_idx+1} band: {bname}')
             return switch
 
+        #
+        # A button per band reads well for a handful of them, but a NISAR ROFF
+        # carries seven fields per layer -- twenty-odd buttons, which made the
+        # palette taller than the screen and silently clipped the ones at the
+        # bottom.  Past MAXBANDBUTTONS the same switchers hang off a dropdown.
+        #
+        MAXBANDBUTTONS = 8
         for p_idx, (idef, ref, si) in enumerate(zip(image_defs, pane_refs, switch_infos)):
             if si is None:
                 continue
@@ -2215,14 +2437,43 @@ def showImage(image_defs, sw, sh, switch_infos=None, rtl=False, gpkg_overlay=Non
                 bnames = getBandNames(si['ds'])
             else:
                 bnames = list(si['loaders'].keys())
-            lbl = f'Bands ({p_idx+1})' if n_imgs > 1 else 'Bands'
-            ttk.Label(btn_col, text=f'{lbl}:', anchor='w').pack(fill='x', padx=2, pady=(2, 0))
-            for bnum, bname in enumerate(bnames, 1):
-                ttk.Button(btn_col, text=bname,
-                           command=make_band_switcher(bname, bnum, idef, ref, si, p_idx)).pack(
-                    side='top', fill='x', pady=1, padx=2)
+            switchers = {bname: make_band_switcher(bname, bnum, idef, ref, si,
+                                                   p_idx)
+                         for bnum, bname in enumerate(bnames, 1)}
+            if n_imgs > 1:
+                ttk.Label(band_box, text=f'Pane {p_idx+1}').pack(
+                    fill='x', padx=4, pady=(2, 0))
+            # One variable per pane holds the live band, so the widgets show
+            # which one is picked (radiobuttons, not plain buttons, which have
+            # no selected state).
+            band_var = tk.StringVar(value=idef['title'] if idef['title']
+                                    in switchers else bnames[0])
+            if len(bnames) <= MAXBANDBUTTONS:
+                for bname in bnames:
+                    ttk.Radiobutton(band_box, text=bname, value=bname,
+                                    variable=band_var, style=TOGGLESTYLE,
+                                    command=switchers[bname]).pack(
+                        fill='x', padx=3, pady=1)
+            else:
+                combo = ttk.Combobox(band_box, textvariable=band_var,
+                                     values=bnames, state='readonly', width=18)
+                combo.pack(fill='x', padx=3, pady=2)
+                combo.bind('<<ComboboxSelected>>',
+                           lambda e, s=switchers, v=band_var: s[v.get()]())
 
     # ---- position palette (right edge if rtl, else left), image window adjacent ----
+    #
+    # Re-measured now the band section exists: a long field name (a NISAR
+    # 'layer1/slantRangeOffset') makes the palette wider than it was when the
+    # viewports were sized, and placing the image window against the old width
+    # would slide it under the palette.
+    #
+    palette.update_idletasks()
+    PAL_W = max(PAL_W, palette.winfo_reqwidth())
+    if rtl:
+        PAL_X = sw - PAL_W - 10
+    else:
+        IMG_X = PAL_X + PAL_W + 5
     win_h_max = sh - IMG_Y - DECO_H
     if stack_horiz:
         win_w = n_imgs * (viewport_w + SCROLLBAR_W) + cbar_w_total
@@ -2258,9 +2509,10 @@ def _computeDiffArray(a, b, add_mode):
     if scale == 0:
         scale = 1.0
     if finite.size:
-        mean = float(np.nanmean(finite))
-        std  = float(np.nanstd(finite))
-        rms  = float(np.sqrt(np.nanmean(finite ** 2)))
+        # finite already excludes NaN, so the plain reductions are enough
+        mean = float(finite.mean())
+        std  = float(finite.std())
+        rms  = float(np.sqrt(np.mean(finite ** 2)))
         dmin = float(finite.min())
         dmax = float(finite.max())
         stats_str = (f'mean={mean:.4g}  std={std:.4g}  rms={rms:.4g}'
@@ -2553,6 +2805,21 @@ def main():
     parser.add_argument('--noCache', action='store_true',
                         help='Disable decimated-band cache (reduces memory use; '
                              're-reads from disk on each band switch)')
+    parser.add_argument('--theme', default='auto', metavar='NAME',
+                        help=f'Widget theme for the control palette and plot '
+                             f'windows (default: auto). "auto" times an X '
+                             f'round trip and takes {LOCALTHEME} on a display '
+                             f'cheap enough to afford it, {DEFAULTTHEME} '
+                             f'otherwise -- the modern themes need many more '
+                             f'round trips, which costs little locally and a '
+                             f'great deal over a forwarded connection. Name a '
+                             f'theme to override: clam, default, alt and '
+                             f'classic are built into Tk and are the cheap '
+                             f'ones; {LOCALTHEME}, arc, breeze, equilux, '
+                             f'adapta, yaru and the rest come from the '
+                             f'optional ttkthemes package. Without that '
+                             f'package, or given an unknown name, '
+                             f'{FALLBACKTHEME} is used')
     parser.add_argument('--right', action='store_true',
                         help='Place the control palette at the right edge of the '
                              'screen, with the image and plot/profile windows '
@@ -2771,7 +3038,8 @@ def main():
             _injectDiff(image_defs, args.add)
             if switch_infos is not None:
                 switch_infos = list(switch_infos) + [None]
-        showImage(image_defs, sw, sh, switch_infos=switch_infos, rtl=args.right)
+        showImage(image_defs, sw, sh, switch_infos=switch_infos,
+                  rtl=args.right, theme=args.theme)
         for _f, _nxi, _nyi, _prod, _loaders, h5, _cc, _rc in nisar_infos:
             h5.close()
         return
@@ -3036,7 +3304,7 @@ def main():
             if nb > 1:
                 bnames = getBandNames(ds)
                 suggestion = ' '.join(bnames[:3])
-                print(f'  Displaying band 1.  To select bands:')
+                print('  Displaying band 1.  To select bands:')
                 print(f'    showimage [options] {os.path.basename(f)} --bands {suggestion}')
                 print(f'  Available bands: {", ".join(bnames)}')
 
@@ -3062,8 +3330,8 @@ def main():
             _col_c = _gt_i[3] + np.arange(_ny_d) * _gt_i[5] * fi
             _row_c = _gt_i[0] + np.arange(_nx_d) * _gt_i[1] * fi
             if embedded_mask is not None:
-                print(f'  Mask found (embedded and/or --mask) -- honored by default '
-                     f'(Mask button to toggle, InvMask to flip sense)')
+                print('  Mask found (embedded and/or --mask) -- honored by '
+                      'default (Mask button to toggle, InvMask to flip sense)')
 
             image_defs.append({
                 'dec': dec,
@@ -3175,7 +3443,7 @@ def main():
               f"  ({len(overlay_data['field_names'])} field(s) available)")
 
     showImage(image_defs, sw, sh, switch_infos=switch_infos, rtl=args.right,
-             gpkg_overlay=gpkg_overlay)
+              gpkg_overlay=gpkg_overlay, theme=args.theme)
 
 
 def showvel():

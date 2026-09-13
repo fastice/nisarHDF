@@ -33,6 +33,7 @@ showimage [options] FILE [FILE ...]
 | `--decFactor N` | auto-fit screen | Decimation factor (per-image when files differ in size) |
 | `--fullRes` | — | Display at full resolution (equivalent to `--decFactor 1`) |
 | `--right` | — | Place the control palette at the right edge of the screen, with the image and plot/profile windows opening to its left (mirrors the default left-to-right layout) — lets a second instance run without overlapping the first |
+| `--theme NAME` | `arc` | Widget theme for the palette and plot windows. `arc`, `equilux` (dark), `yaru`, `adapta`, `breeze` and the rest come from the optional `ttkthemes` package (`pip install ttkthemes`, or `pip install nisarhdf[gui]`); without it, or with a name nothing recognises, the best built-in theme (`clam`) is used and a note is printed. The theme only changes how widgets are drawn |
 | `--mask MASKFILE` | — | External single-band mask file; pixels where the mask is 0 are treated as invalid. Handled exactly like a file's own embedded mask band — honored by default, toggleable via the **Mask** button (see "Mask toggles" below) — not baked in permanently |
 
 **Velocity display (GDAL only):**
@@ -99,7 +100,7 @@ When 2–3 files are given, each opens in its own pane. Images do not need to be
 
 ## NISAR HDF5 support
 
-Pass one or more `.h5`/`.he5`/`.hdf5` NISAR product files directly. The viewer auto-detects the product type from the HDF5 path and lists all displayable fields as band-switch buttons in the palette.
+Pass one or more `.h5`/`.he5`/`.hdf5` NISAR product files directly. The viewer auto-detects the product type from the HDF5 path and lists all displayable fields in the palette's Bands group — as buttons, or as a dropdown once there are more than 8 (an ROFF's per-layer fields).
 
 ### Supported products and fields
 
@@ -183,21 +184,46 @@ invalid) into one effective mask per pane, honored by default:
 
 ## Interactive controls
 
-The floating palette (left window) provides:
+The floating palette (left window, or right with `--right`) is grouped into **Mode**, **Show**,
+**Display** and **Bands**, with the status readout and **Quit** at the bottom. Mode and Show
+controls are toggle buttons: the ones that are on are drawn pressed and tinted, so the live mode
+is visible at a glance. `--theme` picks how the widgets are drawn; the readout is monospaced so
+per-pane values line up.
 
-- **Pick mode** — click a pixel to read its value in all panes simultaneously
-- **Profile mode** — click two points to extract and plot a line profile
+**Mode** — one at a time; clicking the active one turns it off:
+
+- **Pick** — click a pixel to read its value in all panes simultaneously; each pick also leaves a
+  cross on every pane (see **Points**). Re-selecting **Pick** starts a fresh set, the same way a
+  fresh profile clears the last one
+- **Profile** — click two points to extract and plot a line profile
 - **Col Plot / Row Plot** — click a pixel to plot that column or row across all panes
-- **Lines** — toggle visibility of all profile/plot overlay lines
-- **GPKG** *(only shown with `--gpkg`)* — toggle visibility of the GeoPackage overlay
-- **Mask** *(only shown if a mask is detected)* — toggle honoring the combined mask
-  (embedded VRT mask band and/or `--mask`); applied by default (see "Mask toggles" above)
+
+**Show** — independent toggles:
+
+- **Lines** — visibility of the profile and Col/Row plot overlay lines
+- **Points** — visibility of the crosses left by Pick clicks
+- **GPKG** *(only shown with `--gpkg`)* — visibility of the GeoPackage overlay
+- **Mask** *(only shown if a mask is detected)* — honor the combined mask
+  (embedded VRT mask band and/or `--mask`); on by default (see "Mask toggles" above)
 - **InvMask** *(only shown if a mask is detected)* — flip which sense counts as valid for
   the effective combined mask, from whichever source(s) it came from
-- **Sync** *(multi-image only)* — toggle synchronized scrolling across panes; defaults to on when all images are the same size, off when they differ
-- **Colormap selector** — live colormap switching applied to all panes
-- **Modulo input** — enter a value and press Return to apply modulo display per pane
-- **Band buttons** — one button per available band/field; click to switch that pane
+- **Sync** *(multi-image only)* — synchronized scrolling across panes; defaults to on when all images are the same size, off when they differ
+
+**Display**:
+
+- **Plot x: Pixels / Coords** — what the Col/Row/Profile plots put on the x axis: the row/column
+  index, or the image's own coordinates (map x/y for a georeferenced file, slant range and azimuth
+  time for a NISAR product). **Coords** is disabled where there is nothing to plot against — a
+  file with no georeferencing, a raw `.pow` in radar geometry, or a NISAR product without
+  coordinate arrays — since a default 1-per-pixel geotransform is just the pixel index under
+  another name. Defaults to Coords where they exist
+- **Colormap** — live colormap switching applied to all panes
+- **Mod** — enter a value and press Return to apply modulo display (one entry per pane)
+- **Scale** + **Common Scale** *(multi-pane only)* — apply one min/max to every non-RGB pane;
+  the button then reads **Restore Scale**
+
+**Bands** — one button per available band/field, or, for a file with more than 8 (a NISAR ROFF
+has seven fields per layer), a dropdown listing them; either way, picking one switches that pane.
 
 ### Plot window controls
 

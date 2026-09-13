@@ -28,6 +28,11 @@ dependencies = [
     "gdal"
 ]
 
+[project.optional-dependencies]
+# Modern widget themes for showimage's control palette (--theme arc, equilux,
+# yaru, ...). Optional: without it showimage falls back to Tk's own 'clam'.
+gui = ["ttkthemes"]
+
 [tool.setuptools]
 packages = ["nisarhdf"]
 
